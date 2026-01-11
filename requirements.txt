@@ -1,0 +1,6 @@
+# Convenience requirements for running the experiment scripts.
+# Install a CUDA-enabled PyTorch build separately.
+
+-r third_party/mvsplat/requirements.txt
+compressai==1.1.5
+pytorch-msssim==1.0.0

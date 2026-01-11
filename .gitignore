@@ -1,0 +1,67 @@
+# Data / large artifacts
+/dataset/**
+!/dataset/README.md
+
+/checkpoints/**
+!/checkpoints/README.md
+
+/outputs/**
+!/outputs/README.md
+
+# Experiment artifacts
+/experiments/**/compressed/**
+/experiments/**/results/**
+/experiments/**/checkpoints*/**
+/experiments/**/logs*/**
+
+# Third-party build/outputs
+/third_party/**/checkpoints/**
+/third_party/**/outputs/**
+/third_party/**/logs/**
+/third_party/**/wandb/**
+
+# Logging / tracking
+wandb/**
+lightning_logs/**
+runs/**
+logs/**
+*.log
+*.tfevents*
+
+# Model files / arrays
+*.ckpt
+*.pth
+*.pth.tar
+*.pt
+*.bin
+*.npz
+*.npy
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+**/*.egg-info/
+**/*.so
+**/*.pyd
+
+# Environments
+.venv/
+venv/
+env/
+__pypackages__/
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Generated indices
+/assets/**/_generated*/

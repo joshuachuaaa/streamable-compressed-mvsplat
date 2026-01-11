@@ -1,0 +1,4 @@
+Third-party source versions (from legacy working copies):
+mvsplat: 01f9a28edb5eb68416e7e63b01f8d90c3bdfbf01
+ELiC-ReImplemetation: 92a9ece1e6e1a188a12dfd7a58f9b51c554f9f2d
+diff-gaussian-rasterization-modified: 1250c420ebb945f0dce9945086e22faab9157c92
