@@ -207,6 +207,15 @@ def main() -> int:
         help="Progress UI backend (auto prefers rich on TTY, else tqdm).",
     )
     parser.add_argument("--max-steps", type=int, default=10_000, help="Number of training steps.")
+    parser.add_argument(
+        "--max-epochs",
+        type=float,
+        default=None,
+        help=(
+            "Optional epoch budget. If set, overrides --max-steps by converting epochs -> steps "
+            "using the *nominal* train scene count (len(dataset)/batch_size)."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--batch-size", type=int, default=1, help="Train batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="Train dataloader workers.")
@@ -243,6 +252,18 @@ def main() -> int:
         default=50,
         help="Log to stdout / CSV every N steps.",
     )
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=0,
+        help="Save intermediate checkpoints every N optimizer steps (0 disables).",
+    )
+    parser.add_argument(
+        "--save-every-epochs",
+        type=int,
+        default=0,
+        help="Save intermediate checkpoints every N *nominal* epochs (0 disables).",
+    )
     args = parser.parse_args()
 
     if args.device == "cuda":
@@ -259,6 +280,12 @@ def main() -> int:
         raise FileNotFoundError(args.elic_checkpoints)
     if args.unimatch_weights_path is not None and not args.unimatch_weights_path.exists():
         raise FileNotFoundError(args.unimatch_weights_path)
+    if args.save_every_steps < 0:
+        raise SystemExit("--save-every-steps must be >= 0.")
+    if args.save_every_epochs < 0:
+        raise SystemExit("--save-every-epochs must be >= 0.")
+    if args.save_every_steps > 0 and args.save_every_epochs > 0:
+        raise SystemExit("Specify only one of --save-every-steps or --save-every-epochs (not both).")
 
     # Determinism / reproducibility.
     random.seed(args.seed)
@@ -298,6 +325,47 @@ def main() -> int:
     step_tracker = StepTracker()
     dm = DataModule(cfg.dataset, cfg.data_loader, step_tracker=step_tracker, global_rank=0)
     train_loader = dm.train_dataloader()
+
+    # Epoch accounting (for reporting + checkpoint cadence). Note: DatasetRE10k.__len__ is a
+    # nominal upper bound (it does not account for skipped examples), so treat this as an
+    # *approximate* epoch mapping.
+    train_num_scenes_nominal: int | None = None
+    steps_per_epoch_nominal: int | None = None
+    try:
+        train_num_scenes_nominal = int(len(train_loader.dataset))
+    except Exception:
+        train_num_scenes_nominal = None
+
+    if train_num_scenes_nominal is not None:
+        steps_per_epoch_nominal = int(math.ceil(train_num_scenes_nominal / max(1, int(args.batch_size))))
+
+    max_steps = int(args.max_steps)
+    if args.max_epochs is not None:
+        if args.max_epochs <= 0:
+            raise SystemExit("--max-epochs must be > 0.")
+        if steps_per_epoch_nominal is None:
+            raise SystemExit("Cannot use --max-epochs because the train dataloader has no valid __len__.")
+        max_steps = int(math.ceil(float(args.max_epochs) * float(steps_per_epoch_nominal)))
+
+    if steps_per_epoch_nominal is not None:
+        approx_epochs = float(max_steps) / float(steps_per_epoch_nominal)
+        print(
+            "==> Train epoch mapping (nominal): "
+            f"{train_num_scenes_nominal} scenes | batch_size={args.batch_size} "
+            f"-> ~{steps_per_epoch_nominal} steps/epoch | max_steps={max_steps} (~{approx_epochs:.2f} epochs)"
+        )
+    else:
+        print(f"==> max_steps={max_steps} (epoch mapping unavailable; dataset has no __len__)")
+
+    save_every_steps: int | None = None
+    if args.save_every_steps > 0:
+        save_every_steps = int(args.save_every_steps)
+    elif args.save_every_epochs > 0:
+        if steps_per_epoch_nominal is None:
+            raise SystemExit("Cannot use --save-every-epochs because the train dataloader has no valid __len__.")
+        save_every_steps = int(args.save_every_epochs) * int(steps_per_epoch_nominal)
+        if save_every_steps <= 0:
+            raise SystemExit("--save-every-epochs produced a non-positive step interval.")
 
     # Build MVSplat and load pretrained weights.
     encoder, _ = get_encoder(cfg.model.encoder)
@@ -364,6 +432,10 @@ def main() -> int:
         json.dumps(
             {
                 "git_rev": _maybe_git_rev(repo_root),
+                "train_num_scenes_nominal": train_num_scenes_nominal,
+                "steps_per_epoch_nominal": steps_per_epoch_nominal,
+                "max_steps_effective": max_steps,
+                "save_every_steps_effective": save_every_steps,
                 **vars(args),
                 "dataset_root": str(args.dataset_root),
                 "mvsplat_init_ckpt": str(args.mvsplat_init_ckpt),
@@ -534,7 +606,46 @@ def main() -> int:
             "time_s": float(time.time() - start_time),
         }
 
-    max_steps = int(args.max_steps)
+    def save_snapshot(global_step_1b: int) -> None:
+        """Save a minimal, self-contained checkpoint folder for fair export/eval."""
+        ckpt_dir = run_dir / "checkpoints" / f"step_{global_step_1b:07d}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        mvsplat_ckpt_path = ckpt_dir / "mvsplat_finetuned.ckpt"
+        elic_ckpt_path = ckpt_dir / elic_ckpt_name
+
+        import pytorch_lightning as pl
+
+        torch.save(
+            {
+                "epoch": 0,
+                "global_step": int(global_step_1b),
+                "pytorch-lightning_version": pl.__version__,
+                "state_dict": mvsplat.state_dict(),
+                "loops": {},
+            },
+            mvsplat_ckpt_path,
+        )
+        torch.save(elic.state_dict(), elic_ckpt_path)
+
+        approx_epoch = (
+            (float(global_step_1b) / float(steps_per_epoch_nominal))
+            if steps_per_epoch_nominal is not None
+            else None
+        )
+        (ckpt_dir / "checkpoint_meta.json").write_text(
+            json.dumps(
+                {
+                    "global_step": int(global_step_1b),
+                    "approx_epoch_nominal": approx_epoch,
+                    "elapsed_s": float(time.time() - start_time),
+                    "mvsplat_ckpt": str(mvsplat_ckpt_path),
+                    "elic_ckpt": str(elic_ckpt_path),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     if use_rich:
         progress = Progress(
             SpinnerColumn(),
@@ -552,6 +663,9 @@ def main() -> int:
                 if (step % int(args.log_every)) == 0 or step == max_steps - 1:
                     write_row(row)
                     progress.update(task, description=f"train {args.tag} | {fmt(row)}")
+                global_step_1b = int(step) + 1
+                if save_every_steps is not None and (global_step_1b % int(save_every_steps)) == 0:
+                    save_snapshot(global_step_1b)
                 progress.advance(task, 1)
     elif use_tqdm and tqdm is not None:
         desc = f"train {args.tag} (λ={lmbda_str})"
@@ -561,6 +675,9 @@ def main() -> int:
                 if (step % int(args.log_every)) == 0 or step == max_steps - 1:
                     write_row(row)
                     pbar.set_postfix_str(fmt(row))
+                global_step_1b = int(step) + 1
+                if save_every_steps is not None and (global_step_1b % int(save_every_steps)) == 0:
+                    save_snapshot(global_step_1b)
                 pbar.update(1)
     else:
         for step in range(max_steps):
@@ -568,6 +685,9 @@ def main() -> int:
             if (step % int(args.log_every)) == 0 or step == max_steps - 1:
                 write_row(row)
                 print(f"[{step:>6}] {fmt(row)}")
+            global_step_1b = int(step) + 1
+            if save_every_steps is not None and (global_step_1b % int(save_every_steps)) == 0:
+                save_snapshot(global_step_1b)
 
     elapsed = time.time() - start_time
 
@@ -591,7 +711,7 @@ def main() -> int:
     torch.save(
         {
             "epoch": 0,
-            "global_step": int(args.max_steps),
+            "global_step": int(max_steps),
             "pytorch-lightning_version": pl.__version__,
             "state_dict": mvsplat.state_dict(),
             "loops": {},

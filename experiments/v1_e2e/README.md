@@ -12,6 +12,8 @@ The intent is not “train something that looks good”, but to produce a pipeli
 ## Directory contents
 - `experiments/v1_e2e/train_e2e.py`: joint fine-tuning (ELIC + MVSplat).
 - `experiments/v1_e2e/export_eval_fair.py`: one-command export of real bitstreams + fair evaluation.
+- `experiments/v1_e2e/eval_fast_e2e.py`: cheap eval for checkpoint selection (no bitstream export; bpp is an estimate).
+- `experiments/v1_e2e/plot_curves.py`: plot training curves + optional eval curves.
 - Baseline tooling reused:
   - `experiments/v1_baseline/compress.py` (writes `manifest.csv` from true entropy-coded bytes)
   - `experiments/v1_baseline/eval_fair_mvsplat.py` (fixed-index evaluation + PSNR/SSIM/LPIPS)
@@ -152,6 +154,33 @@ This is a standard relaxation for quantization-aware training.
 Training supports `batch_size > 1` (MVSplat supports it in train), but ELIC-in-the-loop is memory heavy.
 For reproducibility, start with `--batch-size 1` and scale only if you have headroom.
 
+### 4.5 Steps vs epochs (how to interpret `--max-steps 10000`)
+`train_e2e.py` is **step-based**, not epoch-based.
+
+For RE10K, you can use the nominal mapping:
+
+`steps_per_epoch ≈ ceil(#train_scenes / batch_size)`
+
+and:
+
+`epochs ≈ max_steps / steps_per_epoch`
+
+Example (current RE10K train index has 66,033 scenes):
+- `batch_size=15` → `steps_per_epoch≈4403` → `max_steps=10000` ≈ `2.27` epochs.
+
+Notes reviewers may care about:
+- This is *nominal*: RE10K filtering (bad shapes, insufficient baseline, etc.) can skip some examples.
+- `train_e2e.py` prints this mapping at startup and records it in `run_args.json`.
+
+### 4.6 Checkpointing cadence (conference-friendly)
+Use `--save-every-epochs 2` (or `--save-every-steps N`) to write intermediate snapshots:
+
+`<run_dir>/checkpoints/step_<global_step>/`
+
+Each snapshot is self-contained and directly usable with both:
+- `experiments/v1_e2e/eval_fast_e2e.py` (cheap checkpoint selection)
+- `experiments/v1_e2e/export_eval_fair.py` (fair test protocol; slower; writes bitstreams)
+
 ---
 
 ## 5) Evaluation and bitrate accounting (non-negotiable for conference-grade)
@@ -184,6 +213,7 @@ python experiments/v1_e2e/train_e2e.py \
   --device cuda \
   --progress auto \
   --max-steps 10000 \
+  --save-every-epochs 2 \
   --batch-size 1 \
   --num-workers 4
 ```
@@ -213,7 +243,30 @@ python experiments/v1_e2e/export_eval_fair.py \
 bash scripts/plot_fair_rd.sh --input outputs/v1_e2e/results/fair_rd.csv
 ```
 
-### 6.4 Sweep all λ values (recommended RD curve recipe)
+### 6.4 Cheap checkpoint selection curves (recommended for “best checkpoint”)
+`eval_fast_e2e.py` runs the fixed-index evaluation **without exporting bitstreams**. This makes it cheap
+enough to run on intermediate snapshots.
+
+Important: it reports `bpp_est` (entropy-model likelihood estimate), not true bitstream size.
+
+```bash
+python experiments/v1_e2e/eval_fast_e2e.py \
+  --tag e2e_step_0008806 \
+  --lambda 0.032 \
+  --run-dir checkpoints/v1_e2e/e2e_lambda_0.032/checkpoints/step_0008806 \
+  --device cuda \
+  --output outputs/v1_e2e/results/fast_eval.csv --append
+```
+
+### 6.5 Plot training + eval curves
+```bash
+python experiments/v1_e2e/plot_curves.py \
+  --run-dir checkpoints/v1_e2e/e2e_lambda_0.032 \
+  --eval-csv outputs/v1_e2e/results/fast_eval.csv \
+  --out outputs/v1_e2e/results
+```
+
+### 6.6 Sweep all λ values (recommended RD curve recipe)
 ```bash
 csv=outputs/v1_e2e/results/fair_rd.csv
 rm -f "$csv"

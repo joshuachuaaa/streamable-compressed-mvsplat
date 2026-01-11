@@ -139,8 +139,16 @@ def _load_elic_model(checkpoint_path: Path, device: str, entropy_coder: str) -> 
 
     # The provided checkpoints are plain OrderedDict state_dicts.
     state_dict = load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
-    model = TestModel().from_state_dict(state_dict).eval()
-    return model.to(device)
+    model = TestModel().from_state_dict(state_dict).eval().to(device)
+    # Ensure entropy-model CDF tables are in sync with quantiles (important for mid-training checkpoints).
+    try:
+        model.update(force=True)
+    except Exception:
+        try:
+            model.update()
+        except Exception:
+            pass
+    return model
 
 
 def _pad_to_multiple(x_bchw: Any, multiple: int) -> tuple[Any, tuple[int, int, int, int]]:
