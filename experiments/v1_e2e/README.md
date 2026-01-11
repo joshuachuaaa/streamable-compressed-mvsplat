@@ -182,10 +182,13 @@ python experiments/v1_e2e/train_e2e.py \
   --elic-checkpoints checkpoints/vanilla/ELIC \
   --output-dir checkpoints/v1_e2e \
   --device cuda \
+  --progress auto \
   --max-steps 10000 \
   --batch-size 1 \
   --num-workers 4
 ```
+
+Tip: set `--progress rich` to force the Rich UI even when stdout is not detected as a TTY.
 
 This writes:
 `checkpoints/v1_e2e/e2e_lambda_0.032/`
