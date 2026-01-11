@@ -96,6 +96,52 @@ def _load_bpp_manifest(manifest_path: Path) -> dict[tuple[str, int], float]:
     return bpp_by_key
 
 
+def _load_bpp_metrics_csv(metrics_path: Path) -> dict[tuple[str, int], float]:
+    """Load (scene, frame)->bpp from a legacy ELIC baseline metrics.csv.
+
+    Expected columns:
+      - scene
+      - image_idx (or frame)
+      - bpp
+    """
+    if not metrics_path.exists():
+        raise FileNotFoundError(metrics_path)
+
+    bpp_by_key: dict[tuple[str, int], float] = {}
+    with metrics_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            scene = row.get("scene")
+            frame = row.get("image_idx") or row.get("frame")
+            bpp = row.get("bpp")
+            if scene is None or frame is None or bpp is None:
+                continue
+            bpp_by_key[(scene, int(frame))] = float(bpp)
+    return bpp_by_key
+
+
+def _sum_bytes(obj: Any) -> int:
+    if isinstance(obj, (bytes, bytearray)):
+        return len(obj)
+    if isinstance(obj, (list, tuple)):
+        return sum(_sum_bytes(x) for x in obj)
+    if isinstance(obj, dict):
+        return sum(_sum_bytes(v) for v in obj.values())
+    return 0
+
+
+def _find_frame_file(scene_dir: Path, frame: int, suffix: str) -> Path:
+    candidates = [
+        scene_dir / f"{frame}{suffix}",
+        scene_dir / f"{frame:03d}{suffix}",
+        scene_dir / f"{frame:06d}{suffix}",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"Missing {suffix} for frame={frame} under {scene_dir}")
+
+
 def main() -> int:
     repo_root = _repo_root()
     _add_mvsplat_to_path(repo_root)
@@ -213,19 +259,45 @@ def main() -> int:
     # Optional compressed context config.
     bpp_by_key: dict[tuple[str, int], float] | None = None
     if args.compressed_root is not None:
+        # Two supported layouts:
+        # 1) Repo-native: <root>/manifest.csv + <root>/recon/<scene>/<frame:06d>.png
+        # 2) Legacy baseline_ELIC: <root>/metrics.csv + <root>/<scene>/<frame:03d>.png (+ .bin)
+        recon_root = None
+
         manifest_path = args.compressed_root / "manifest.csv"
-        bpp_by_key = _load_bpp_manifest(manifest_path)
-        recon_root = args.compressed_root / "recon"
-        if not recon_root.exists():
-            raise FileNotFoundError(recon_root)
+        metrics_path = args.compressed_root / "metrics.csv"
+        if manifest_path.exists():
+            bpp_by_key = _load_bpp_manifest(manifest_path)
+            recon_root = args.compressed_root / "recon"
+        elif metrics_path.exists():
+            bpp_by_key = _load_bpp_metrics_csv(metrics_path)
+            recon_root = args.compressed_root
+        else:
+            raise FileNotFoundError(
+                f"Unsupported compressed-root layout: expected {manifest_path} or {metrics_path}"
+            )
+
+        if recon_root is None or not recon_root.exists():
+            raise FileNotFoundError(recon_root if recon_root is not None else args.compressed_root)
 
         from src.misc.image_io import load_image
 
-        def load_recon(scene: str, frame: int) -> Any:
-            path = recon_root / scene / f"{frame:0>6}.png"
-            if not path.exists():
-                raise FileNotFoundError(path)
-            return load_image(path)
+        is_manifest_layout = manifest_path.exists()
+
+        def load_recon(
+            scene: str, frame: int, *, target_hw: tuple[int, int]
+        ) -> tuple[Any, tuple[int, int]]:
+            if is_manifest_layout:
+                path = recon_root / scene / f"{frame:0>6}.png"
+            else:
+                path = _find_frame_file(recon_root / scene, frame, ".png")
+            img = load_image(path)
+            orig_hw = tuple(img.shape[-2:])
+            if orig_hw != target_hw:
+                from src.dataset.shims.crop_shim import rescale_and_crop
+
+                img, _ = rescale_and_crop(img, intrinsics=img.new_zeros(3, 3), shape=target_hw)
+            return img, orig_hw
 
     # Evaluate.
     psnr_list: list[float] = []
@@ -241,14 +313,41 @@ def main() -> int:
             # DataLoader yields CPU tensors; keep scene as python string.
             scene = batch["scene"][0]
             context_frames = [int(x) for x in batch["context"]["index"][0].tolist()]
+            target_hw = tuple(batch["context"]["image"].shape[-2:])
 
             # Replace context images if requested.
             if args.compressed_root is not None:
                 assert bpp_by_key is not None
-                recon = torch.stack([load_recon(scene, fr) for fr in context_frames], dim=0)  # [2,3,H,W]
+                recon_views: list[torch.Tensor] = []
+                bpps: list[float] = []
+
+                for fr in context_frames:
+                    img, orig_hw = load_recon(scene, fr, target_hw=target_hw)
+                    recon_views.append(img)
+
+                    key = (scene, fr)
+                    if key in bpp_by_key:
+                        bpps.append(bpp_by_key[key])
+                        continue
+                    if is_manifest_layout:
+                        raise KeyError(
+                            f"Missing bpp for {key} in {manifest_path} (and no *.bin fallback in manifest layout)."
+                        )
+                    bin_path = _find_frame_file(Path(args.compressed_root) / scene, fr, ".bin")
+                    try:
+                        payload = torch.load(bin_path, map_location="cpu", weights_only=False)
+                    except TypeError:
+                        payload = torch.load(bin_path, map_location="cpu")
+
+                    strings = payload.get("strings") if isinstance(payload, dict) else payload
+                    num_bits = 8 * _sum_bytes(strings)
+                    num_pixels = int(orig_hw[0] * orig_hw[1])
+                    bpps.append(num_bits / float(num_pixels))
+
+                recon = torch.stack(recon_views, dim=0)  # [2,3,H,W]
                 batch["context"]["image"][0] = recon
 
-                bpp_scene = sum(bpp_by_key[(scene, fr)] for fr in context_frames) / len(context_frames)
+                bpp_scene = sum(bpps) / len(bpps)
                 bpp_list.append(bpp_scene)
 
             # Move to device and apply model-required shims.

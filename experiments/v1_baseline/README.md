@@ -18,6 +18,9 @@ python experiments/v1_baseline/compress.py \
   --skip-existing
 ```
 
+If you already have precomputed ELIC outputs under `outputs/baseline_ELIC/compressed/` (legacy layout),
+you can skip this step and use `--compressed-root outputs/baseline_ELIC/compressed/lambda_<λ>` during eval.
+
 Outputs (per λ):
 
 ```text

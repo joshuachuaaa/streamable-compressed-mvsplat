@@ -23,6 +23,9 @@ python experiments/v1_baseline/compress.py \
 
 If you're on a CPU-only machine, add `--device cpu` (expect it to be slow).
 
+If you already have precomputed ELIC outputs in the legacy layout under `outputs/baseline_ELIC/compressed/`,
+skip this step and point `--compressed-root` at `outputs/baseline_ELIC/compressed/lambda_<λ>` during eval.
+
 ### 2) Run fair evaluation (vanilla + V1)
 
 Vanilla MVSplat (no compression):
