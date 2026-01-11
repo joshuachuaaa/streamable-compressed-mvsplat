@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,20 @@ def _add_mvsplat_to_path(repo_root: Path) -> None:
 
 def _load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _safe_filename(text: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", text).strip("._-")
+    return safe or "run"
+
+
+def _resolve_output_csv_path(output: Path, *, tag: str) -> Path:
+    output = output.expanduser()
+    if output.exists() and output.is_dir():
+        return output / f"fair_{_safe_filename(tag)}.csv"
+    if not output.exists() and output.suffix == "":
+        return output.with_suffix(".csv")
+    return output
 
 
 def _move_to_device(x: Any, device: str) -> Any:
@@ -232,7 +247,12 @@ def main() -> int:
         default=24.0,
         help="What bpp to report for the vanilla (uncompressed) point.",
     )
-    parser.add_argument("--output", type=Path, required=True, help="Output CSV path.")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Output CSV path (if a directory is provided, writes fair_<tag>.csv inside).",
+    )
     parser.add_argument(
         "--append",
         action=argparse.BooleanOptionalAction,
@@ -264,6 +284,24 @@ def main() -> int:
         )
     if args.batch_size != 1:
         raise SystemExit("This script currently supports --batch-size=1 only.")
+
+    raw_output = args.output
+    args.output = _resolve_output_csv_path(args.output, tag=args.tag)
+    if args.output != raw_output:
+        print(f"[output] {raw_output} -> {args.output}")
+        if raw_output == Path("."):
+            print(
+                "[output] Note: '.' usually means you passed an empty shell variable; "
+                "prefer passing an explicit file like --output outputs/fair_vanilla.csv"
+            )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Preflight check: fail fast on unwritable output paths (and avoid running ~6k scenes then crashing).
+        with args.output.open("a", newline="", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        raise SystemExit(f"Cannot write --output={args.output}: {exc}") from exc
 
     expected_scenes = _count_non_null_scenes(args.index_path)
     is_tty = sys.stdout.isatty() or sys.stderr.isatty()
