@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import re
+from collections import deque
 from pathlib import Path
 
 
@@ -46,6 +47,21 @@ def _resolve_out_path(out: Path, run_dir: Path) -> Path:
     return out
 
 
+def _moving_average(values: list[float], window: int) -> list[float]:
+    if window <= 1:
+        return values
+    q: deque[float] = deque()
+    s = 0.0
+    out: list[float] = []
+    for v in values:
+        q.append(float(v))
+        s += float(v)
+        if len(q) > window:
+            s -= q.popleft()
+        out.append(s / float(len(q)))
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Plot V1-E2E train/eval curves")
     parser.add_argument(
@@ -65,6 +81,18 @@ def main() -> int:
         type=Path,
         default=None,
         help="Optional eval CSV from eval_fast_e2e.py (plots PSNR/SSIM/LPIPS).",
+    )
+    parser.add_argument(
+        "--train-mode",
+        choices=["step", "epoch"],
+        default="step",
+        help="Use per-step train_log.csv or epoch-averaged train_epoch_log.csv (if present).",
+    )
+    parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=0,
+        help="Optional moving-average window for per-step curves (0 disables).",
     )
     parser.add_argument(
         "--x-axis",
@@ -88,9 +116,19 @@ def main() -> int:
     if not train_log.exists():
         raise FileNotFoundError(train_log)
 
+    if args.smooth_window < 0:
+        raise SystemExit("--smooth-window must be >= 0.")
+    if args.train_mode == "epoch" and args.smooth_window > 0:
+        raise SystemExit("--smooth-window applies only to --train-mode=step (epoch mode is already averaged).")
+
     steps_per_epoch = _try_load_steps_per_epoch(args.run_dir)
     if args.x_axis == "epoch" and (steps_per_epoch is None or steps_per_epoch <= 0):
         raise SystemExit("Cannot use --x-axis=epoch because run_args.json lacks steps_per_epoch_nominal.")
+
+    if args.train_mode == "epoch":
+        train_log = args.run_dir / "train_epoch_log.csv"
+        if not train_log.exists():
+            raise FileNotFoundError(train_log)
 
     train_rows = _read_csv(train_log)
     if not train_rows:
@@ -108,13 +146,26 @@ def main() -> int:
     train_dist: list[float] = []
     for row in train_rows:
         try:
-            s = int(float(row["step"]))
-            train_step.append(s)
-            train_loss.append(float(row["loss_total"]))
-            train_bpp.append(float(row["rate_bpp"]))
-            train_dist.append(float(row["dist_nvs"]))
+            if args.train_mode == "epoch":
+                # epoch log uses step_end and *_mean columns.
+                s = int(float(row["step_end"]))
+                train_step.append(s)
+                train_loss.append(float(row["loss_total_mean"]))
+                train_bpp.append(float(row["rate_bpp_mean"]))
+                train_dist.append(float(row["dist_nvs_mean"]))
+            else:
+                s = int(float(row["step"]))
+                train_step.append(s)
+                train_loss.append(float(row["loss_total"]))
+                train_bpp.append(float(row["rate_bpp"]))
+                train_dist.append(float(row["dist_nvs"]))
         except Exception:
             continue
+
+    if args.train_mode == "step" and args.smooth_window > 1:
+        train_loss = _moving_average(train_loss, int(args.smooth_window))
+        train_bpp = _moving_average(train_bpp, int(args.smooth_window))
+        train_dist = _moving_average(train_dist, int(args.smooth_window))
 
     eval_points: list[dict[str, float]] = []
     if args.eval_csv is not None:
@@ -162,17 +213,32 @@ def main() -> int:
 
     ax = axes[0, 0]
     ax.plot(x_train, train_loss, linewidth=1.2)
-    ax.set_title("train: total loss")
+    title = "train: total loss"
+    if args.train_mode == "epoch":
+        title += " (epoch avg)"
+    elif args.smooth_window > 1:
+        title += f" (MA{int(args.smooth_window)})"
+    ax.set_title(title)
     ax.set_xlabel(x_label)
 
     ax = axes[0, 1]
     ax.plot(x_train, train_bpp, linewidth=1.2)
-    ax.set_title("train: bpp (estimate)")
+    title = "train: bpp (estimate)"
+    if args.train_mode == "epoch":
+        title += " (epoch avg)"
+    elif args.smooth_window > 1:
+        title += f" (MA{int(args.smooth_window)})"
+    ax.set_title(title)
     ax.set_xlabel(x_label)
 
     ax = axes[0, 2]
     ax.plot(x_train, train_dist, linewidth=1.2)
-    ax.set_title("train: distortion (NVS loss)")
+    title = "train: distortion (NVS loss)"
+    if args.train_mode == "epoch":
+        title += " (epoch avg)"
+    elif args.smooth_window > 1:
+        title += f" (MA{int(args.smooth_window)})"
+    ax.set_title(title)
     ax.set_xlabel(x_label)
 
     ax = axes[1, 0]
@@ -211,4 +277,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

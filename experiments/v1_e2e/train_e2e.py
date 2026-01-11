@@ -427,6 +427,7 @@ def main() -> int:
     run_dir = args.output_dir / f"{args.tag}_lambda_{lmbda_str}"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "train_log.csv"
+    epoch_log_path = run_dir / "train_epoch_log.csv"
     args_path = run_dir / "run_args.json"
     args_path.write_text(
         json.dumps(
@@ -496,6 +497,23 @@ def main() -> int:
         with log_path.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(header)
 
+    epoch_header = [
+        "epoch",
+        "step_start",
+        "step_end",
+        "num_steps",
+        "loss_total_mean",
+        "rate_bpp_mean",
+        "dist_nvs_mean",
+        "dist_nvs_scaled_mean",
+        "ctx_mse_mean",
+        "aux_loss_mean",
+        "time_s_end",
+    ]
+    if steps_per_epoch_nominal is not None and not epoch_log_path.exists():
+        with epoch_log_path.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(epoch_header)
+
     start_time = time.time()
 
     def write_row(row: dict[str, float]) -> None:
@@ -510,6 +528,13 @@ def main() -> int:
             f"dist={row['dist_nvs']:.4f} "
             f"aux={row['aux_loss']:.4f}"
         )
+
+    def write_epoch_row(row: dict[str, float]) -> None:
+        if steps_per_epoch_nominal is None:
+            return
+        with epoch_log_path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=epoch_header)
+            w.writerow({k: row.get(k, "") for k in epoch_header})
 
     iterator = iter(train_loader)
 
@@ -606,6 +631,58 @@ def main() -> int:
             "time_s": float(time.time() - start_time),
         }
 
+    epoch_sums: dict[str, float] = {}
+    epoch_count = 0
+    epoch_idx_0b: int | None = None
+    epoch_step_start_1b: int | None = None
+
+    def epoch_accumulate(row: dict[str, float], global_step_1b: int) -> None:
+        nonlocal epoch_sums, epoch_count, epoch_idx_0b, epoch_step_start_1b
+        if steps_per_epoch_nominal is None:
+            return
+        current_epoch_0b = int((global_step_1b - 1) // int(steps_per_epoch_nominal))
+        if epoch_idx_0b is None:
+            epoch_idx_0b = current_epoch_0b
+            epoch_step_start_1b = global_step_1b
+        if current_epoch_0b != epoch_idx_0b:
+            # This should only happen if steps_per_epoch_nominal changes mid-run (it shouldn't).
+            epoch_idx_0b = current_epoch_0b
+            epoch_step_start_1b = global_step_1b
+            epoch_sums = {}
+            epoch_count = 0
+
+        for k in ("loss_total", "rate_bpp", "dist_nvs", "dist_nvs_scaled", "ctx_mse", "aux_loss"):
+            epoch_sums[k] = epoch_sums.get(k, 0.0) + float(row[k])
+        epoch_count += 1
+
+    def epoch_maybe_flush(row: dict[str, float], *, global_step_1b: int, is_last_step: bool) -> None:
+        nonlocal epoch_sums, epoch_count, epoch_idx_0b, epoch_step_start_1b
+        if steps_per_epoch_nominal is None or epoch_count <= 0:
+            return
+        is_epoch_end = (global_step_1b % int(steps_per_epoch_nominal)) == 0
+        if not is_epoch_end and not is_last_step:
+            return
+        assert epoch_idx_0b is not None and epoch_step_start_1b is not None
+        write_epoch_row(
+            {
+                "epoch": float(epoch_idx_0b + 1),
+                "step_start": float(epoch_step_start_1b),
+                "step_end": float(global_step_1b),
+                "num_steps": float(epoch_count),
+                "loss_total_mean": epoch_sums["loss_total"] / epoch_count,
+                "rate_bpp_mean": epoch_sums["rate_bpp"] / epoch_count,
+                "dist_nvs_mean": epoch_sums["dist_nvs"] / epoch_count,
+                "dist_nvs_scaled_mean": epoch_sums["dist_nvs_scaled"] / epoch_count,
+                "ctx_mse_mean": epoch_sums["ctx_mse"] / epoch_count,
+                "aux_loss_mean": epoch_sums["aux_loss"] / epoch_count,
+                "time_s_end": float(row["time_s"]),
+            }
+        )
+        epoch_sums = {}
+        epoch_count = 0
+        epoch_idx_0b = None
+        epoch_step_start_1b = None
+
     def save_snapshot(global_step_1b: int) -> None:
         """Save a minimal, self-contained checkpoint folder for fair export/eval."""
         ckpt_dir = run_dir / "checkpoints" / f"step_{global_step_1b:07d}"
@@ -664,6 +741,8 @@ def main() -> int:
                     write_row(row)
                     progress.update(task, description=f"train {args.tag} | {fmt(row)}")
                 global_step_1b = int(step) + 1
+                epoch_accumulate(row, global_step_1b)
+                epoch_maybe_flush(row, global_step_1b=global_step_1b, is_last_step=step == max_steps - 1)
                 if save_every_steps is not None and (global_step_1b % int(save_every_steps)) == 0:
                     save_snapshot(global_step_1b)
                 progress.advance(task, 1)
@@ -676,6 +755,8 @@ def main() -> int:
                     write_row(row)
                     pbar.set_postfix_str(fmt(row))
                 global_step_1b = int(step) + 1
+                epoch_accumulate(row, global_step_1b)
+                epoch_maybe_flush(row, global_step_1b=global_step_1b, is_last_step=step == max_steps - 1)
                 if save_every_steps is not None and (global_step_1b % int(save_every_steps)) == 0:
                     save_snapshot(global_step_1b)
                 pbar.update(1)
@@ -686,6 +767,8 @@ def main() -> int:
                 write_row(row)
                 print(f"[{step:>6}] {fmt(row)}")
             global_step_1b = int(step) + 1
+            epoch_accumulate(row, global_step_1b)
+            epoch_maybe_flush(row, global_step_1b=global_step_1b, is_last_step=step == max_steps - 1)
             if save_every_steps is not None and (global_step_1b % int(save_every_steps)) == 0:
                 save_snapshot(global_step_1b)
 
