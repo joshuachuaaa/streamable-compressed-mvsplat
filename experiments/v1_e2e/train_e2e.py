@@ -181,6 +181,12 @@ def main() -> int:
         default="cuda",
         help="Training device.",
     )
+    parser.add_argument(
+        "--progress",
+        choices=["auto", "rich", "tqdm", "none"],
+        default="auto",
+        help="Progress UI backend (auto prefers rich on TTY, else tqdm).",
+    )
     parser.add_argument("--max-steps", type=int, default=10_000, help="Number of training steps.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--batch-size", type=int, default=1, help="Train batch size.")
@@ -345,20 +351,36 @@ def main() -> int:
     # Progress UI.
     is_tty = os.isatty(1) or os.isatty(2)
     use_rich = False
-    try:
-        if is_tty:
-            from rich.progress import (
-                BarColumn,
-                Progress,
-                SpinnerColumn,
-                TextColumn,
-                TimeElapsedColumn,
-                TimeRemainingColumn,
-            )
+    use_tqdm = False
+    tqdm = None  # type: ignore[assignment]
+    if args.progress in ("auto", "rich"):
+        try:
+            if args.progress == "rich" or is_tty:
+                from rich.progress import (  # type: ignore[import-not-found]
+                    BarColumn,
+                    Progress,
+                    SpinnerColumn,
+                    TextColumn,
+                    TimeElapsedColumn,
+                    TimeRemainingColumn,
+                )
 
-            use_rich = True
-    except Exception:
+                use_rich = True
+        except Exception:
+            use_rich = False
+
+    if not use_rich and args.progress in ("auto", "tqdm"):
+        try:
+            from tqdm import tqdm as _tqdm  # type: ignore[import-not-found]
+
+            tqdm = _tqdm
+            use_tqdm = True
+        except Exception:
+            use_tqdm = False
+
+    if args.progress == "none":
         use_rich = False
+        use_tqdm = False
 
     # Training loop.
     header = [
@@ -376,7 +398,6 @@ def main() -> int:
             csv.writer(f).writerow(header)
 
     start_time = time.time()
-    step = 0
 
     def write_row(row: dict[str, float]) -> None:
         with log_path.open("a", newline="", encoding="utf-8") as f:
@@ -392,6 +413,14 @@ def main() -> int:
         )
 
     iterator = iter(train_loader)
+
+    def next_batch() -> dict[str, Any]:
+        nonlocal iterator
+        try:
+            return next(iterator)
+        except StopIteration:
+            iterator = iter(train_loader)
+            return next(iterator)
 
     def run_step(batch: dict[str, Any], global_step: int) -> dict[str, Any]:
         # Keep view sampling schedules consistent with MVSplat.
@@ -450,6 +479,35 @@ def main() -> int:
             "ctx_mse": ctx_mse.detach(),
         }
 
+    def train_one_step(global_step: int) -> dict[str, float]:
+        batch = next_batch()
+
+        optim_main.zero_grad(set_to_none=True)
+        optim_aux.zero_grad(set_to_none=True)
+
+        out = run_step(batch, global_step)
+        out["loss_total"].backward()
+        if args.grad_clip and args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(mvsplat.parameters(), float(args.grad_clip))
+            torch.nn.utils.clip_grad_norm_(elic.parameters(), float(args.grad_clip))
+        optim_main.step()
+
+        aux_loss = elic.aux_loss()
+        aux_loss.backward()
+        optim_aux.step()
+
+        return {
+            "step": float(global_step),
+            "loss_total": float(out["loss_total"].detach().cpu().item()),
+            "rate_bpp": float(out["rate_bpp"].cpu().item()),
+            "dist_nvs": float(out["dist_nvs"].cpu().item()),
+            "dist_nvs_scaled": float(out["dist_nvs_scaled"].cpu().item()),
+            "ctx_mse": float(out["ctx_mse"].cpu().item()),
+            "aux_loss": float(aux_loss.detach().cpu().item()),
+            "time_s": float(time.time() - start_time),
+        }
+
+    max_steps = int(args.max_steps)
     if use_rich:
         progress = Progress(
             SpinnerColumn(),
@@ -460,82 +518,29 @@ def main() -> int:
             TimeRemainingColumn(),
             refresh_per_second=10,
         )
-        task = progress.add_task(f"train {args.tag} (λ={lmbda_str})", total=int(args.max_steps))
+        task = progress.add_task(f"train {args.tag} (λ={lmbda_str})", total=max_steps)
         with progress:
-            while step < int(args.max_steps):
-                try:
-                    batch = next(iterator)
-                except StopIteration:
-                    iterator = iter(train_loader)
-                    batch = next(iterator)
-
-                optim_main.zero_grad(set_to_none=True)
-                optim_aux.zero_grad(set_to_none=True)
-
-                out = run_step(batch, step)
-                out["loss_total"].backward()
-                if args.grad_clip and args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(mvsplat.parameters(), float(args.grad_clip))
-                    torch.nn.utils.clip_grad_norm_(elic.parameters(), float(args.grad_clip))
-                optim_main.step()
-
-                aux_loss = elic.aux_loss()
-                aux_loss.backward()
-                optim_aux.step()
-
-                if (step % int(args.log_every)) == 0 or step == int(args.max_steps) - 1:
-                    row = {
-                        "step": float(step),
-                        "loss_total": float(out["loss_total"].detach().cpu().item()),
-                        "rate_bpp": float(out["rate_bpp"].cpu().item()),
-                        "dist_nvs": float(out["dist_nvs"].cpu().item()),
-                        "dist_nvs_scaled": float(out["dist_nvs_scaled"].cpu().item()),
-                        "ctx_mse": float(out["ctx_mse"].cpu().item()),
-                        "aux_loss": float(aux_loss.detach().cpu().item()),
-                        "time_s": float(time.time() - start_time),
-                    }
+            for step in range(max_steps):
+                row = train_one_step(step)
+                if (step % int(args.log_every)) == 0 or step == max_steps - 1:
                     write_row(row)
                     progress.update(task, description=f"train {args.tag} | {fmt(row)}")
-
                 progress.advance(task, 1)
-                step += 1
+    elif use_tqdm and tqdm is not None:
+        desc = f"train {args.tag} (λ={lmbda_str})"
+        with tqdm(total=max_steps, desc=desc, dynamic_ncols=True) as pbar:
+            for step in range(max_steps):
+                row = train_one_step(step)
+                if (step % int(args.log_every)) == 0 or step == max_steps - 1:
+                    write_row(row)
+                    pbar.set_postfix_str(fmt(row))
+                pbar.update(1)
     else:
-        while step < int(args.max_steps):
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                iterator = iter(train_loader)
-                batch = next(iterator)
-
-            optim_main.zero_grad(set_to_none=True)
-            optim_aux.zero_grad(set_to_none=True)
-
-            out = run_step(batch, step)
-            out["loss_total"].backward()
-            if args.grad_clip and args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(mvsplat.parameters(), float(args.grad_clip))
-                torch.nn.utils.clip_grad_norm_(elic.parameters(), float(args.grad_clip))
-            optim_main.step()
-
-            aux_loss = elic.aux_loss()
-            aux_loss.backward()
-            optim_aux.step()
-
-            if (step % int(args.log_every)) == 0 or step == int(args.max_steps) - 1:
-                row = {
-                    "step": float(step),
-                    "loss_total": float(out["loss_total"].detach().cpu().item()),
-                    "rate_bpp": float(out["rate_bpp"].cpu().item()),
-                    "dist_nvs": float(out["dist_nvs"].cpu().item()),
-                    "dist_nvs_scaled": float(out["dist_nvs_scaled"].cpu().item()),
-                    "ctx_mse": float(out["ctx_mse"].cpu().item()),
-                    "aux_loss": float(aux_loss.detach().cpu().item()),
-                    "time_s": float(time.time() - start_time),
-                }
+        for step in range(max_steps):
+            row = train_one_step(step)
+            if (step % int(args.log_every)) == 0 or step == max_steps - 1:
                 write_row(row)
                 print(f"[{step:>6}] {fmt(row)}")
-
-            step += 1
 
     elapsed = time.time() - start_time
 
