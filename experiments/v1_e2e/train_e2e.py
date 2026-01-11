@@ -3,7 +3,7 @@
 
 This script implements the *joint* optimization variant:
 
-  x_ctx (2 views) -> ELIC -> x̂_ctx -> MVSplat -> Î_tgt (1 view)
+  x_ctx (2 views) -> ELIC -> x̂_ctx -> MVSplat -> Î_tgt (N views)
 
 and optimizes a rate–distortion objective where the "distortion" is *novel view
 synthesis error* on the target view(s), and the "rate" is the entropy-model
@@ -613,8 +613,10 @@ def main() -> int:
         out = run_step(batch, global_step)
         out["loss_total"].backward()
         if args.grad_clip and args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(mvsplat.parameters(), float(args.grad_clip))
-            torch.nn.utils.clip_grad_norm_(elic.parameters(), float(args.grad_clip))
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in list(mvsplat.parameters()) + list(elic.parameters()) if p.requires_grad],
+                float(args.grad_clip),
+            )
         optim_main.step()
 
         aux_loss = elic.aux_loss()
