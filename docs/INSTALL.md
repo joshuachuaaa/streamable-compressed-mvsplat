@@ -28,6 +28,7 @@ Install Python dependencies:
 ```bash
 pip install -r third_party/mvsplat/requirements.txt
 pip install compressai pytorch-msssim
+pip install rich  # nicer progress bars in this repo's scripts
 ```
 
 Build/install the CUDA rasterizer:

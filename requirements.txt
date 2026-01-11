@@ -4,3 +4,4 @@
 -r third_party/mvsplat/requirements.txt
 compressai==1.1.5
 pytorch-msssim==1.0.0
+rich>=13.7.0

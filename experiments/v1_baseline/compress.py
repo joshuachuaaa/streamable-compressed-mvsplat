@@ -18,9 +18,7 @@ import argparse
 import csv
 import json
 import math
-import os
 import sys
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -320,7 +318,25 @@ def main() -> int:
     # Basic sanity: index stats.
     eval_index = _load_json(args.index_path)
     num_non_null = sum(v is not None for v in eval_index.values())
+    expected_images = sum(len(v.get("context", [])) for v in eval_index.values() if v is not None)
     print(f"Evaluation index scenes (non-null): {num_non_null:,}")
+
+    is_tty = sys.stdout.isatty() or sys.stderr.isatty()
+    use_rich = False
+    try:
+        if is_tty:
+            from rich.progress import (
+                BarColumn,
+                Progress,
+                SpinnerColumn,
+                TextColumn,
+                TimeElapsedColumn,
+                TimeRemainingColumn,
+            )
+
+            use_rich = True
+    except Exception:
+        use_rich = False
 
     args.output_root.mkdir(parents=True, exist_ok=True)
     (args.output_root / "_meta").mkdir(parents=True, exist_ok=True)
@@ -352,14 +368,21 @@ def main() -> int:
 
         rows_to_append: list[dict[str, Any]] = []
         scenes_done = 0
+        images_done = 0
 
-        # Iterate through evaluation dataset once for this lambda.
-        for batch in _iter_eval_context_batches(cfg):
+        images_total: int | None = expected_images
+        if args.skip_existing:
+            remaining = expected_images - len(processed)
+            images_total = remaining if remaining >= 0 else None
+
+        def process_scene(batch: dict[str, Any]) -> int:
+            nonlocal scenes_done, images_done
             scene = batch["scene"][0]
             # batch_size=1 always for test loader.
             context_indices = [int(x) for x in batch["context"]["index"][0].tolist()]
             context_images = batch["context"]["image"][0]  # [2,3,H,W]
 
+            new_images = 0
             for view_slot, frame in enumerate(context_indices):
                 key = (scene, frame)
                 if key in processed:
@@ -414,13 +437,57 @@ def main() -> int:
                         "ckpt": str(ckpt_path),
                     }
                 )
+                new_images += 1
+                images_done += 1
 
             scenes_done += 1
-            if args.max_scenes is not None and scenes_done >= args.max_scenes:
-                break
+            return new_images
 
-            if scenes_done % 200 == 0:
-                print(f"  processed scenes: {scenes_done:,} | new images: {len(rows_to_append):,}")
+        # Iterate through evaluation dataset once for this lambda.
+        if use_rich:
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("{task.description}"),
+                BarColumn(bar_width=None),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                refresh_per_second=10,
+            )
+            task_scenes = progress.add_task(f"λ={lmbda_str} scenes", total=num_non_null)
+            task_images = progress.add_task(f"λ={lmbda_str} images", total=images_total)
+            with progress:
+                for batch in _iter_eval_context_batches(cfg):
+                    new_images = process_scene(batch)
+                    progress.advance(task_scenes, 1)
+                    if new_images:
+                        progress.advance(task_images, new_images)
+
+                    if args.max_scenes is not None and scenes_done >= args.max_scenes:
+                        break
+        else:
+            try:
+                from tqdm import tqdm
+            except Exception:
+                tqdm = None  # type: ignore
+
+            iterator = _iter_eval_context_batches(cfg)
+            pbar = None
+            if tqdm is not None and is_tty:
+                pbar = tqdm(total=images_total, desc=f"ELIC λ={lmbda_str} images")
+            for batch in iterator:
+                new_images = process_scene(batch)
+                if pbar is not None and new_images:
+                    pbar.update(new_images)
+                    if images_done % 50 == 0:
+                        pbar.set_postfix_str(f"scenes={scenes_done:,} new={len(rows_to_append):,}")
+
+                if args.max_scenes is not None and scenes_done >= args.max_scenes:
+                    break
+                if pbar is None and scenes_done % 200 == 0:
+                    print(f"  processed scenes: {scenes_done:,} | new images: {len(rows_to_append):,}")
+            if pbar is not None:
+                pbar.close()
 
         # Write/append manifest.
         is_new = not manifest_path.exists()

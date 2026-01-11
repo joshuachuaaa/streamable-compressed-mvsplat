@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -97,7 +98,25 @@ def _verify_against_dataset(
     if limit_chunks is not None:
         chunk_items = chunk_items[:limit_chunks]
 
-    for i, (chunk_name, scenes) in enumerate(chunk_items, start=1):
+    is_tty = sys.stdout.isatty() or sys.stderr.isatty()
+    use_rich = False
+    try:
+        if is_tty:
+            from rich.progress import (
+                BarColumn,
+                Progress,
+                SpinnerColumn,
+                TextColumn,
+                TimeElapsedColumn,
+                TimeRemainingColumn,
+            )
+
+            use_rich = True
+    except Exception:
+        use_rich = False
+
+    def verify_chunk(chunk_name: str, scenes: list[tuple[str, dict[str, Any]]]) -> None:
+        nonlocal checked_scenes
         chunk_path = stage_dir / chunk_name
         if not chunk_path.exists():
             raise FileNotFoundError(chunk_path)
@@ -136,8 +155,37 @@ def _verify_against_dataset(
 
             checked_scenes += 1
 
-        if i % 10 == 0 or i == len(chunk_items):
-            print(f"Checked chunks: {i}/{len(chunk_items)} | scenes verified: {checked_scenes:,}")
+    if use_rich:
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(bar_width=None),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            refresh_per_second=10,
+        )
+        task = progress.add_task("Checking chunks", total=len(chunk_items))
+        with progress:
+            for i, (chunk_name, scenes) in enumerate(chunk_items, start=1):
+                verify_chunk(chunk_name, scenes)
+                progress.advance(task, 1)
+                if i % 10 == 0 or i == len(chunk_items):
+                    progress.update(task, description=f"Checking chunks | scenes verified: {checked_scenes:,}")
+    else:
+        try:
+            from tqdm import tqdm
+        except Exception:
+            tqdm = None  # type: ignore
+
+        iterator = chunk_items
+        if tqdm is not None and is_tty:
+            iterator = tqdm(chunk_items, total=len(chunk_items), desc="Checking chunks")  # type: ignore
+
+        for i, (chunk_name, scenes) in enumerate(iterator, start=1):
+            verify_chunk(chunk_name, scenes)
+            if tqdm is None and (i % 10 == 0 or i == len(chunk_items)):
+                print(f"Checked chunks: {i}/{len(chunk_items)} | scenes verified: {checked_scenes:,}")
 
     if bad_indices:
         preview = "\n".join(bad_indices[:20])

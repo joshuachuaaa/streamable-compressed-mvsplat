@@ -132,6 +132,16 @@ def _load_bpp_metrics_csv(metrics_path: Path) -> dict[tuple[str, int], float]:
     return bpp_by_key
 
 
+def _count_non_null_scenes(index_path: Path) -> int | None:
+    try:
+        index = _load_json(index_path)
+    except Exception:
+        return None
+    if not isinstance(index, dict):
+        return None
+    return sum(v is not None for v in index.values())
+
+
 def _sum_bytes(obj: Any) -> int:
     if isinstance(obj, (bytes, bytearray)):
         return len(obj)
@@ -255,6 +265,9 @@ def main() -> int:
     if args.batch_size != 1:
         raise SystemExit("This script currently supports --batch-size=1 only.")
 
+    expected_scenes = _count_non_null_scenes(args.index_path)
+    is_tty = sys.stdout.isatty() or sys.stderr.isatty()
+
     # Load config + build model.
     persistent_workers: bool | None = None
     if args.persistent_workers != "auto":
@@ -346,95 +359,170 @@ def main() -> int:
             return img, orig_hw
 
     # Evaluate.
-    psnr_list: list[float] = []
-    ssim_list: list[float] = []
-    lpips_list: list[float] = []
-    bpp_list: list[float] = []
+    psnr_sum = 0.0
+    ssim_sum = 0.0
+    lpips_sum = 0.0
+    bpp_sum = 0.0
+    bpp_count = 0
+    num_scenes = 0
 
     import torch
-    from einops import rearrange
 
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
-            # DataLoader yields CPU tensors; keep scene as python string.
-            scene = batch["scene"][0]
-            context_frames = [int(x) for x in batch["context"]["index"][0].tolist()]
-            target_hw = tuple(batch["context"]["image"].shape[-2:])
-
-            # Replace context images if requested.
-            if args.compressed_root is not None:
-                assert bpp_by_key is not None
-                recon_views: list[torch.Tensor] = []
-                bpps: list[float] = []
-
-                for fr in context_frames:
-                    img, orig_hw = load_recon(scene, fr, target_hw=target_hw)
-                    recon_views.append(img)
-
-                    key = (scene, fr)
-                    if key in bpp_by_key:
-                        bpps.append(bpp_by_key[key])
-                        continue
-                    if is_manifest_layout:
-                        raise KeyError(
-                            f"Missing bpp for {key} in {manifest_path} (and no *.bin fallback in manifest layout)."
-                        )
-                    bin_path = _find_frame_file(Path(args.compressed_root) / scene, fr, ".bin")
-                    try:
-                        payload = torch.load(bin_path, map_location="cpu", weights_only=False)
-                    except TypeError:
-                        payload = torch.load(bin_path, map_location="cpu")
-
-                    strings = payload.get("strings") if isinstance(payload, dict) else payload
-                    num_bits = 8 * _sum_bytes(strings)
-                    num_pixels = int(orig_hw[0] * orig_hw[1])
-                    bpps.append(num_bits / float(num_pixels))
-
-                recon = torch.stack(recon_views, dim=0)  # [2,3,H,W]
-                batch["context"]["image"][0] = recon
-
-                bpp_scene = sum(bpps) / len(bpps)
-                bpp_list.append(bpp_scene)
-
-            # Move to device and apply model-required shims.
-            batch = _move_to_device(batch, args.device)
-            batch = data_shim(batch)
-
-            _, _, _, h, w = batch["target"]["image"].shape
-
-            gaussians = model.encoder(batch["context"], global_step=0, deterministic=False)
-            output = model.decoder.forward(
-                gaussians,
-                batch["target"]["extrinsics"],
-                batch["target"]["intrinsics"],
-                batch["target"]["near"],
-                batch["target"]["far"],
-                (h, w),
-                depth_mode=None,
+    use_rich = False
+    try:
+        if is_tty:
+            from rich.progress import (
+                BarColumn,
+                Progress,
+                SpinnerColumn,
+                TextColumn,
+                TimeElapsedColumn,
+                TimeRemainingColumn,
             )
 
-            rgb = output.color[0]  # [V,3,H,W]
-            rgb_gt = batch["target"]["image"][0]  # [V,3,H,W]
+            use_rich = True
+    except Exception:
+        use_rich = False
 
-            # Treat view dimension as batch dimension for metric computation.
-            psnr_list.append(compute_psnr(rgb_gt, rgb).mean().item())
-            ssim_list.append(compute_ssim(rgb_gt, rgb).mean().item())
-            lpips_list.append(compute_lpips(rgb_gt, rgb).mean().item())
+    def fmt_metrics() -> str:
+        if num_scenes == 0:
+            return "psnr=? ssim=? lpips=?"
+        return (
+            f"psnr={psnr_sum / num_scenes:.2f} "
+            f"ssim={ssim_sum / num_scenes:.4f} "
+            f"lpips={lpips_sum / num_scenes:.4f}"
+        )
 
-            if args.max_scenes is not None and (batch_idx + 1) >= args.max_scenes:
-                break
-            if (batch_idx + 1) % 200 == 0:
-                print(f"evaluated scenes: {batch_idx + 1:,}")
+    def process_batch(batch: dict[str, Any]) -> tuple[float, float, float, float | None]:
+        scene = batch["scene"][0]
+        context_frames = [int(x) for x in batch["context"]["index"][0].tolist()]
+        target_hw = tuple(batch["context"]["image"].shape[-2:])
 
-    num_scenes = len(psnr_list)
+        bpp_scene: float | None = None
+        if args.compressed_root is not None:
+            assert bpp_by_key is not None
+            recon_views: list[torch.Tensor] = []
+            bpps: list[float] = []
+
+            for fr in context_frames:
+                img, orig_hw = load_recon(scene, fr, target_hw=target_hw)
+                recon_views.append(img)
+
+                key = (scene, fr)
+                if key in bpp_by_key:
+                    bpps.append(bpp_by_key[key])
+                    continue
+                if is_manifest_layout:
+                    raise KeyError(
+                        f"Missing bpp for {key} in {manifest_path} "
+                        "(and no *.bin fallback in manifest layout)."
+                    )
+                bin_path = _find_frame_file(Path(args.compressed_root) / scene, fr, ".bin")
+                try:
+                    payload = torch.load(bin_path, map_location="cpu", weights_only=False)
+                except TypeError:
+                    payload = torch.load(bin_path, map_location="cpu")
+
+                strings = payload.get("strings") if isinstance(payload, dict) else payload
+                num_bits = 8 * _sum_bytes(strings)
+                num_pixels = int(orig_hw[0] * orig_hw[1])
+                bpps.append(num_bits / float(num_pixels))
+
+            recon = torch.stack(recon_views, dim=0)  # [2,3,H,W]
+            batch["context"]["image"][0] = recon
+            bpp_scene = float(sum(bpps) / len(bpps))
+
+        # Move to device and apply model-required shims.
+        batch = _move_to_device(batch, args.device)
+        batch = data_shim(batch)
+
+        _, _, _, h, w = batch["target"]["image"].shape
+        gaussians = model.encoder(batch["context"], global_step=0, deterministic=False)
+        output = model.decoder.forward(
+            gaussians,
+            batch["target"]["extrinsics"],
+            batch["target"]["intrinsics"],
+            batch["target"]["near"],
+            batch["target"]["far"],
+            (h, w),
+            depth_mode=None,
+        )
+
+        rgb = output.color[0]  # [V,3,H,W]
+        rgb_gt = batch["target"]["image"][0]  # [V,3,H,W]
+        psnr_val = float(compute_psnr(rgb_gt, rgb).mean().item())
+        ssim_val = float(compute_ssim(rgb_gt, rgb).mean().item())
+        lpips_val = float(compute_lpips(rgb_gt, rgb).mean().item())
+        return psnr_val, ssim_val, lpips_val, bpp_scene
+
+    with torch.no_grad():
+        desc_base = f"Eval {args.tag}"
+        if use_rich:
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("{task.description}"),
+                BarColumn(bar_width=None),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                refresh_per_second=10,
+            )
+            task = progress.add_task(desc_base, total=expected_scenes)
+            with progress:
+                for batch_idx, batch in enumerate(loader, start=1):
+                    psnr_val, ssim_val, lpips_val, bpp_scene = process_batch(batch)
+                    psnr_sum += psnr_val
+                    ssim_sum += ssim_val
+                    lpips_sum += lpips_val
+                    num_scenes += 1
+                    if bpp_scene is not None:
+                        bpp_sum += bpp_scene
+                        bpp_count += 1
+
+                    progress.advance(task, 1)
+                    if num_scenes % 10 == 0:
+                        progress.update(task, description=f"{desc_base} | {fmt_metrics()}")
+
+                    if args.max_scenes is not None and batch_idx >= args.max_scenes:
+                        break
+        else:
+            try:
+                from tqdm import tqdm
+            except Exception:
+                tqdm = None  # type: ignore
+
+            iterator = loader
+            pbar = None
+            if tqdm is not None and is_tty:
+                pbar = tqdm(loader, total=expected_scenes, desc=desc_base)
+                iterator = pbar
+
+            for batch_idx, batch in enumerate(iterator, start=1):
+                psnr_val, ssim_val, lpips_val, bpp_scene = process_batch(batch)
+                psnr_sum += psnr_val
+                ssim_sum += ssim_val
+                lpips_sum += lpips_val
+                num_scenes += 1
+                if bpp_scene is not None:
+                    bpp_sum += bpp_scene
+                    bpp_count += 1
+
+                if pbar is not None and num_scenes % 10 == 0:
+                    pbar.set_postfix_str(fmt_metrics())
+
+                if args.max_scenes is not None and batch_idx >= args.max_scenes:
+                    break
+                if pbar is None and batch_idx % 200 == 0:
+                    print(f"evaluated scenes: {batch_idx:,}")
+
     if num_scenes == 0:
         raise SystemExit("No scenes evaluated (check dataset + index).")
 
-    psnr = sum(psnr_list) / num_scenes
-    ssim = sum(ssim_list) / num_scenes
-    lpips = sum(lpips_list) / num_scenes
+    psnr = psnr_sum / num_scenes
+    ssim = ssim_sum / num_scenes
+    lpips = lpips_sum / num_scenes
     bpp = (
-        (sum(bpp_list) / len(bpp_list))
+        (bpp_sum / bpp_count)
         if args.compressed_root is not None
         else float(args.vanilla_bpp)
     )
