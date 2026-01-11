@@ -186,7 +186,11 @@ def main() -> int:
         "--compressed-root",
         type=Path,
         default=None,
-        help="If set, use reconstructions from <root>/recon/<scene>/<frame>.png and bpp from <root>/manifest.csv.",
+        help=(
+            "Use compressed context frames from a directory. Supported layouts:\n"
+            "  (1) Repo-native: <root>/recon/<scene>/<frame>.png + <root>/manifest.csv\n"
+            "  (2) Legacy: <root>/<scene>/<frame>.png (+ optional .bin) + <root>/metrics.csv"
+        ),
     )
     parser.add_argument(
         "--device",
