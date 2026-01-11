@@ -101,6 +101,7 @@ def _load_mvsplat_cfg_train(
     num_workers: int,
     persistent_workers: bool,
     seed: int,
+    unimatch_weights_path: Path | None,
 ) -> tuple[Any, Any]:
     """Compose the upstream MVSplat config (+experiment=re10k) for training."""
     from hydra import compose, initialize_config_dir
@@ -121,6 +122,14 @@ def _load_mvsplat_cfg_train(
         f"data_loader.train.persistent_workers={str(bool(persistent_workers)).lower()}",
         f"data_loader.train.seed={int(seed)}",
     ]
+    # The upstream config points to an external Unimatch/GmDepth weights file used
+    # only to initialize the multiview backbone when training from scratch. For
+    # fine-tuning from a full MVSplat checkpoint, we disable this by default to
+    # avoid requiring that extra artifact.
+    if unimatch_weights_path is None:
+        overrides.append("model.encoder.unimatch_weights_path=null")
+    else:
+        overrides.append(f"model.encoder.unimatch_weights_path={unimatch_weights_path.resolve()}")
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg_dict = compose(config_name="main", overrides=overrides)
     set_cfg(cfg_dict)
@@ -182,6 +191,16 @@ def main() -> int:
         help="Training device.",
     )
     parser.add_argument(
+        "--unimatch-weights-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional Unimatch/GmDepth checkpoint used only for scratch initialization of the MVSplat "
+            "multiview backbone. When fine-tuning from --mvsplat-init-ckpt, leave unset (default) "
+            "to avoid requiring this extra file."
+        ),
+    )
+    parser.add_argument(
         "--progress",
         choices=["auto", "rich", "tqdm", "none"],
         default="auto",
@@ -238,6 +257,8 @@ def main() -> int:
         raise FileNotFoundError(args.mvsplat_init_ckpt)
     if not args.elic_checkpoints.exists():
         raise FileNotFoundError(args.elic_checkpoints)
+    if args.unimatch_weights_path is not None and not args.unimatch_weights_path.exists():
+        raise FileNotFoundError(args.unimatch_weights_path)
 
     # Determinism / reproducibility.
     random.seed(args.seed)
@@ -260,7 +281,13 @@ def main() -> int:
         num_workers=args.num_workers,
         persistent_workers=args.persistent_workers,
         seed=args.seed,
+        unimatch_weights_path=args.unimatch_weights_path,
     )
+    if args.unimatch_weights_path is None:
+        print(
+            "==> Unimatch/GmDepth backbone init: disabled (fine-tuning loads backbone weights from "
+            f"{args.mvsplat_init_ckpt})"
+        )
     from src.dataset.data_module import DataModule, get_data_shim
     from src.loss import get_losses
     from src.misc.step_tracker import StepTracker
