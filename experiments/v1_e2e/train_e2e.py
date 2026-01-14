@@ -14,7 +14,7 @@ Notes:
     (2 context views, and `num_target_views` targets; for RE10K the upstream
     dataset-specific config uses 4 target views).
   - This script does not run validation; evaluate with the fixed eval index via
-    `experiments/v1_e2e/export_eval_fair.py` (which uses `experiments/baselines/eval_fair_mvsplat.py`).
+    `experiments/v1_e2e/export_eval_fair.py` (which uses `experiments/eval/eval_fair_mvsplat.py`).
 """
 
 from __future__ import annotations

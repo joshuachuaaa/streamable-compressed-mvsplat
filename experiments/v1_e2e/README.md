@@ -15,7 +15,7 @@ The intent is not “train something that looks good”, but to produce a pipeli
 - `experiments/v1_e2e/eval_fast_e2e.py`: cheap eval for checkpoint selection (no bitstream export; bpp is an estimate).
 - `experiments/v1_e2e/plot_curves.py`: plot training curves + optional eval curves.
 - Baseline evaluator reused:
-  - `experiments/baselines/eval_fair_mvsplat.py` (fixed-index evaluation + PSNR/SSIM/LPIPS)
+  - `experiments/eval/eval_fair_mvsplat.py` (fixed-index evaluation + PSNR/SSIM/LPIPS)
 
 ---
 
@@ -68,7 +68,7 @@ We use a fixed, canonical evaluation index:
 - `assets/indices/re10k/evaluation_index_re10k.json` (2 context → 3 target)
 
 Evaluation is run with:
-- `experiments/baselines/eval_fair_mvsplat.py`
+- `experiments/eval/eval_fair_mvsplat.py`
 
 Why fixed-index evaluation:
 - Eliminates “sampling luck” and makes RD points comparable.
@@ -210,7 +210,7 @@ Why this is critical:
 All metrics are computed on:
 - `assets/indices/re10k/evaluation_index_re10k.json`
 using:
-- `experiments/baselines/eval_fair_mvsplat.py`
+- `experiments/eval/eval_fair_mvsplat.py`
 
 ---
 

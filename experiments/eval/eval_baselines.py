@@ -5,7 +5,7 @@ Baselines covered:
   1) Vanilla MVSplat (no compression).
   2) Vanilla ELIC -> MVSplat (precomputed decoded context images + manifest bpp).
 
-This is an orchestration wrapper around `experiments/baselines/eval_fair_mvsplat.py`
+This is an orchestration wrapper around `experiments/eval/eval_fair_mvsplat.py`
 to standardize output locations and avoid "where did my CSV go?" confusion.
 """
 
@@ -222,7 +222,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    eval_script = repo_root / "experiments" / "baselines" / "eval_fair_mvsplat.py"
+    eval_script = repo_root / "experiments" / "eval" / "eval_fair_mvsplat.py"
     if not eval_script.exists():
         raise FileNotFoundError(eval_script)
 

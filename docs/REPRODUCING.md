@@ -4,7 +4,7 @@ This repo contains:
 - **V1 baseline** (ELIC-compressed context frames → MVSplat).
 - **V1 E2E** (end-to-end fine-tuning of ELIC + MVSplat with an RD objective).
 
-- Baselines: `experiments/baselines/`
+- Evaluation + baselines: `experiments/eval/`
 - V1 E2E: `experiments/v1_e2e/`
 
 ## Fair R–D plot (baselines)
@@ -30,7 +30,7 @@ compress the **cropped** 256×256 inputs. For conference-grade RD curves, regene
 This writes one canonical CSV:
 
 ```bash
-python experiments/baselines/eval_baselines.py \
+python experiments/eval/eval_baselines.py \
   --compressed-base outputs/v1_baseline/compressed \
   --out-csv outputs/v1_baseline/results/fair_rd.csv \
   --device cuda

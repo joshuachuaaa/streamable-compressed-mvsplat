@@ -29,7 +29,7 @@ If your precomputed artifacts live elsewhere, pass `--compressed-base` to `eval_
 ## Run baseline evaluation
 
 ```bash
-python experiments/baselines/eval_baselines.py \
+python experiments/eval/eval_baselines.py \
   --tag-prefix v1_lambda_ \
   --compressed-base outputs/v1_baseline/compressed \
   --out-csv outputs/v1_baseline/results/fair_rd.csv \

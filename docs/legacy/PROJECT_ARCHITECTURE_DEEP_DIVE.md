@@ -342,8 +342,8 @@ The V1 system inserts ELIC compression upstream of MVSplat for controlled study 
 
 | Script | Location | Purpose |
 |--------|----------|---------|
-| [eval_baselines.py](../../experiments/baselines/eval_baselines.py) | Baselines | Evaluate **vanilla** + **vanilla ELIC→MVSplat** baselines on the fixed eval index; reads bpp from `manifest.csv`. |
-| [eval_fair_mvsplat.py](../../experiments/baselines/eval_fair_mvsplat.py) | Baselines | Fixed-index evaluator used by baselines and E2E (optionally swaps in decoded contexts and reads bpp from `manifest.csv`). |
+| [eval_baselines.py](../../experiments/eval/eval_baselines.py) | Baselines | Evaluate **vanilla** + **vanilla ELIC→MVSplat** baselines on the fixed eval index; reads bpp from `manifest.csv`. |
+| [eval_fair_mvsplat.py](../../experiments/eval/eval_fair_mvsplat.py) | Evaluator | Fixed-index evaluator used by baselines and E2E (optionally swaps in decoded contexts and reads bpp from `manifest.csv`). |
 | [plot_fair_rd.py](../../experiments/plot_fair_rd.py) | Plotting | Plot RD curves from the CSV output of `eval_fair_mvsplat.py`. |
 | [generate_re10k_evaluation_index.py](../../scripts/indices/generate_re10k_evaluation_index.py) | Indices | Optional: regenerate `assets/indices/re10k/evaluation_index_re10k.json` using MVSplat’s generator. |
 
@@ -354,7 +354,7 @@ The V1 system inserts ELIC compression upstream of MVSplat for controlled study 
 python scripts/verify_eval_index.py assets/indices/re10k/evaluation_index_re10k.json --check-dataset
 
 # Step 1: evaluate baselines (vanilla + vanilla ELIC→MVSplat) into one CSV.
-python experiments/baselines/eval_baselines.py \\
+python experiments/eval/eval_baselines.py \\
   --compressed-base outputs/v1_baseline/compressed \\
   --out-csv outputs/v1_baseline/results/fair_rd.csv
 

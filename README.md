@@ -17,7 +17,7 @@ This codebase studies bitrate-constrained novel view synthesis built around **MV
 ## Repo layout
 
 - `experiments/`: entry points
-  - baselines: `experiments/baselines/`
+  - evaluation + baselines: `experiments/eval/`
   - E2E: `experiments/v1_e2e/`
   - shared plotting: `experiments/plot_fair_rd.py`
 - `third_party/`: vendored dependencies (MVSplat, ELIC, rasterizer)

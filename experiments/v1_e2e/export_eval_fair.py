@@ -6,7 +6,7 @@ Conference-grade requirements addressed:
   - Bitrate is computed from *real entropy-coded bytes* from `ELIC.compress`.
   - Exported context reconstructions match MVSplat's actual inputs (RE10K pipeline crops to 256×256).
   - Evaluation uses the same fixed-protocol evaluator as the baselines:
-      `experiments/baselines/eval_fair_mvsplat.py`
+      `experiments/eval/eval_fair_mvsplat.py`
 """
 
 from __future__ import annotations
@@ -326,7 +326,7 @@ def main() -> int:
     # 2) Run fair evaluation against MVSplat using decoded contexts (and manifest bpp).
     eval_cmd = [
         sys.executable,
-        str(repo_root / "experiments" / "baselines" / "eval_fair_mvsplat.py"),
+        str(repo_root / "experiments" / "eval" / "eval_fair_mvsplat.py"),
         "--tag",
         args.tag,
         "--dataset-root",
@@ -353,4 +353,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
