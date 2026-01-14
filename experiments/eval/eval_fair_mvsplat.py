@@ -98,7 +98,8 @@ def _find_frame_file(scene_dir: Path, frame: int, ext: str) -> Path:
 
 
 def _add_third_party_to_path(repo_root: Path) -> None:
-    sys.path.insert(0, str(repo_root / "third_party" / "mvsplat"))
+    # Back-compat alias (older name).
+    _add_mvsplat_to_path(repo_root)
 
 
 def _load_mvsplat_cfg(
@@ -241,7 +242,7 @@ def main() -> int:
     from src.model.encoder import get_encoder
     from src.model.model_wrapper import ModelWrapper, OptimizerCfg, TestCfg, TrainCfg
 
-    encoder, _ = get_encoder(cfg.model.encoder)
+    encoder, encoder_visualizer = get_encoder(cfg.model.encoder)
     decoder = get_decoder(cfg.model.decoder, cfg.dataset)
     model_kwargs = {
         "optimizer_cfg": OptimizerCfg(lr=0.0, warm_up_steps=0, cosine_lr=False),
@@ -256,7 +257,13 @@ def main() -> int:
         "losses": get_losses(cfg.loss),
         "step_tracker": None,
     }
-    model = ModelWrapper.load_from_checkpoint(str(args.mvsplat_ckpt), encoder=encoder, decoder=decoder, **model_kwargs)
+    model = ModelWrapper.load_from_checkpoint(
+        str(args.mvsplat_ckpt),
+        encoder=encoder,
+        encoder_visualizer=encoder_visualizer,
+        decoder=decoder,
+        **model_kwargs,
+    )
     model = model.to(args.device)
     model.eval()
 
@@ -410,14 +417,32 @@ def main() -> int:
         "compressed_root": "" if args.compressed_root is None else str(args.compressed_root),
     }
 
-    write_header = True
-    if args.append and args.output.exists() and args.output.stat().st_size > 0:
-        write_header = False
-    with args.output.open("a" if args.append else "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    # Safe CSV writes even when multiple eval processes append concurrently.
+    # (Useful when users run one process per lambda in parallel.)
+    if args.append:
+        mode = "a"
+    else:
+        mode = "w"
+
+    try:
+        import fcntl  # type: ignore
+    except Exception:  # pragma: no cover
+        fcntl = None  # type: ignore
+
+    with args.output.open(mode, newline="", encoding="utf-8") as f:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            write_header = True
+            if mode == "a" and args.output.exists() and args.output.stat().st_size > 0:
+                write_header = False
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
     print("Wrote:", args.output)
     print("Row:", row)
@@ -426,4 +451,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
