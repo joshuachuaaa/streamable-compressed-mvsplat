@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import asdict, is_dataclass
 import json
 import math
 import os
@@ -247,6 +248,18 @@ def main() -> int:
         ),
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument(
+        "--view-sampler-step-offset",
+        type=int,
+        default=None,
+        help=(
+            "Offset added to the shared global step used by MVSplat's view sampler schedules and other "
+            "step-conditioned components (e.g., LPIPS apply_after_step). "
+            "If unset, defaults to the dataset view sampler warm_up_steps (i.e., start at end-of-warmup) "
+            "so fine-tuning from a pretrained MVSplat checkpoint uses the same view-sampling regime. "
+            "Set 0 to reproduce warmup-from-scratch behavior."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=1, help="Train batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="Train dataloader workers.")
     parser.add_argument(
@@ -256,8 +269,36 @@ def main() -> int:
         help="Use persistent dataloader workers (recommended when num_workers>0).",
     )
     parser.add_argument("--lr-mvsplat", type=float, default=1e-5, help="LR for MVSplat parameters.")
-    parser.add_argument("--lr-elic", type=float, default=1e-5, help="LR for ELIC parameters (excluding aux).")
+    parser.add_argument("--lr-elic", type=float, default=3e-5, help="LR for ELIC parameters (excluding aux).")
     parser.add_argument("--lr-elic-aux", type=float, default=1e-3, help="LR for ELIC aux parameters (.quantiles).")
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["onecycle", "none"],
+        default="onecycle",
+        help=(
+            "LR schedule for the *main* optimizer (MVSplat + ELIC main params). "
+            "`onecycle` matches upstream MVSplat's default cosine OneCycle schedule; "
+            "`none` keeps constant learning rates."
+        ),
+    )
+    parser.add_argument(
+        "--onecycle-pct-start",
+        type=float,
+        default=0.01,
+        help="OneCycleLR warmup fraction (pct_start).",
+    )
+    parser.add_argument(
+        "--onecycle-div-factor",
+        type=float,
+        default=25.0,
+        help="OneCycleLR div_factor (initial_lr = max_lr/div_factor).",
+    )
+    parser.add_argument(
+        "--onecycle-final-div-factor",
+        type=float,
+        default=10_000.0,
+        help="OneCycleLR final_div_factor (min_lr = max_lr/final_div_factor).",
+    )
     parser.add_argument(
         "--ctx-reg-beta",
         type=float,
@@ -273,8 +314,8 @@ def main() -> int:
     parser.add_argument(
         "--grad-clip",
         type=float,
-        default=1.0,
-        help="Global norm gradient clipping (0 disables).",
+        default=0.5,
+        help="Global norm gradient clipping (0 disables). Default matches upstream MVSplat.",
     )
     parser.add_argument(
         "--log-every",
@@ -393,6 +434,34 @@ def main() -> int:
     else:
         print(f"==> max_steps={max_steps} (epoch mapping unavailable; dataset has no __len__)")
 
+    view_sampler_warmup_steps: int | None = None
+    try:
+        view_sampler_warmup_steps = int(getattr(cfg.dataset.view_sampler, "warm_up_steps", 0))
+    except Exception:
+        view_sampler_warmup_steps = None
+
+    view_sampler_step_offset = args.view_sampler_step_offset
+    if view_sampler_step_offset is None:
+        if view_sampler_warmup_steps is not None and view_sampler_warmup_steps > 0:
+            view_sampler_step_offset = int(view_sampler_warmup_steps)
+        else:
+            view_sampler_step_offset = 0
+    if int(view_sampler_step_offset) < 0:
+        raise SystemExit("--view-sampler-step-offset must be >= 0.")
+
+    if view_sampler_warmup_steps is not None and view_sampler_warmup_steps > 0:
+        print(
+            "==> View sampler schedule: "
+            f"warm_up_steps={int(view_sampler_warmup_steps)} | "
+            f"step_offset={int(view_sampler_step_offset)} "
+            f"({'post-warmup' if int(view_sampler_step_offset) >= int(view_sampler_warmup_steps) else 'in-warmup'})"
+        )
+    else:
+        print(f"==> View sampler schedule: warm_up_steps=0 | step_offset={int(view_sampler_step_offset)}")
+
+    # Ensure dataloader worker prefetching starts from the intended schedule step.
+    step_tracker.set_step(int(view_sampler_step_offset))
+
     save_every_steps: int | None = None
     if args.save_every_steps > 0:
         save_every_steps = int(args.save_every_steps)
@@ -429,6 +498,51 @@ def main() -> int:
     mvsplat = ModelWrapper.load_from_checkpoint(str(args.mvsplat_init_ckpt), strict=True, **model_kwargs)
     mvsplat = mvsplat.train().to(args.device)
 
+    # Print + record upstream loss config (critique-resistance: avoid "hidden schedules" ambiguity).
+    mvsplat_losses_summary: list[dict[str, Any]] = []
+    lpips_apply_after_step: int | None = None
+    for loss_fn in mvsplat.losses:
+        cfg_obj = getattr(loss_fn, "cfg", None)
+        cfg_payload: Any
+        if cfg_obj is not None and is_dataclass(cfg_obj):
+            cfg_payload = asdict(cfg_obj)
+        else:
+            cfg_payload = str(cfg_obj)
+        mvsplat_losses_summary.append(
+            {
+                "name": getattr(loss_fn, "name", type(loss_fn).__name__),
+                "class": type(loss_fn).__name__,
+                "cfg": cfg_payload,
+            }
+        )
+        if type(loss_fn).__name__ == "LossLpips":
+            try:
+                lpips_apply_after_step = int(getattr(loss_fn.cfg, "apply_after_step", 0))
+            except Exception:
+                lpips_apply_after_step = None
+
+    if mvsplat_losses_summary:
+        parts: list[str] = []
+        for item in mvsplat_losses_summary:
+            name = str(item.get("name", "loss"))
+            cfg = item.get("cfg", {})
+            if isinstance(cfg, dict) and cfg:
+                cfg_str = ", ".join(f"{k}={cfg[k]}" for k in sorted(cfg.keys()))
+                parts.append(f"{name}({cfg_str})")
+            else:
+                parts.append(name)
+        print("==> MVSplat loss config:", " + ".join(parts))
+        if lpips_apply_after_step is not None:
+            start_step = int(view_sampler_step_offset)
+            if start_step >= int(lpips_apply_after_step):
+                print(f"==> MVSplat LPIPS: active from step 0 (effective_global_step starts at {start_step})")
+            else:
+                print(
+                    "==> MVSplat LPIPS: inactive at step 0 "
+                    f"(apply_after_step={int(lpips_apply_after_step)}, effective_global_step starts at {start_step}). "
+                    "Set --view-sampler-step-offset accordingly if you intend to enable LPIPS during fine-tuning."
+                )
+
     # The encoder expects a data shim (e.g., normalize intrinsics layout).
     data_shim = get_data_shim(mvsplat.encoder)
 
@@ -457,6 +571,21 @@ def main() -> int:
         betas=(0.9, 0.999),
     )
     optim_aux = torch.optim.Adam(elic_aux_params, lr=float(args.lr_elic_aux), betas=(0.9, 0.999))
+    scheduler_main = None
+    if args.lr_schedule != "none":
+        if args.lr_schedule == "onecycle":
+            scheduler_main = torch.optim.lr_scheduler.OneCycleLR(
+                optim_main,
+                max_lr=[float(args.lr_mvsplat), float(args.lr_elic)],
+                total_steps=int(max_steps),
+                pct_start=float(args.onecycle_pct_start),
+                cycle_momentum=False,
+                anneal_strategy="cos",
+                div_factor=float(args.onecycle_div_factor),
+                final_div_factor=float(args.onecycle_final_div_factor),
+            )
+        else:
+            raise RuntimeError(f"Unhandled --lr-schedule={args.lr_schedule}")
 
     # Outputs.
     lmbda_str = _format_lambda(args.lmbda)
@@ -478,6 +607,16 @@ def main() -> int:
     ):
         run_name = f"{run_name}_s_{float(args.nvs_mse_scale):g}"
     run_dir = args.output_dir / run_name
+    if (run_dir / "train_log.csv").exists() or (run_dir / "run_args.json").exists():
+        # Avoid silently mixing logs/checkpoints when reusing a tag.
+        i = 2
+        while True:
+            candidate = args.output_dir / f"{run_name}_run{i}"
+            if not (candidate / "train_log.csv").exists() and not (candidate / "run_args.json").exists():
+                print(f"==> Output dir exists; writing to: {candidate} (use a unique --tag to avoid this)")
+                run_dir = candidate
+                break
+            i += 1
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "train_log.csv"
     epoch_log_path = run_dir / "train_epoch_log.csv"
@@ -488,10 +627,13 @@ def main() -> int:
                 "git_rev": _maybe_git_rev(repo_root),
                 "train_num_scenes_nominal": train_num_scenes_nominal,
                 "steps_per_epoch_nominal": steps_per_epoch_nominal,
+                "run_name_effective": str(run_dir.name),
+                "mvsplat_losses": mvsplat_losses_summary,
                 "max_steps_effective": max_steps,
                 "save_every_steps_effective": save_every_steps,
                 "rd_lambda_effective": float(rd_lambda),
                 "nvs_mse_scale_effective": float(args.nvs_mse_scale),
+                "view_sampler_step_offset_effective": int(view_sampler_step_offset),
                 **vars(args),
                 "dataset_root": str(args.dataset_root),
                 "mvsplat_init_ckpt": str(args.mvsplat_init_ckpt),
@@ -513,8 +655,11 @@ def main() -> int:
             if args.progress == "rich" or is_tty:
                 from rich.progress import (  # type: ignore[import-not-found]
                     BarColumn,
+                    MofNCompleteColumn,
                     Progress,
+                    ProgressColumn,
                     SpinnerColumn,
+                    TaskProgressColumn,
                     TextColumn,
                     TimeElapsedColumn,
                     TimeRemainingColumn,
@@ -540,6 +685,9 @@ def main() -> int:
     # Training loop.
     header = [
         "step",
+        "lr_mvsplat",
+        "lr_elic",
+        "lr_elic_aux",
         "loss_total",
         "rate_bpp",
         "dist_nvs",
@@ -548,6 +696,7 @@ def main() -> int:
         "dist_nvs_scaled",
         "ctx_mse",
         "aux_loss",
+        "grad_norm",
         "time_s",
     ]
     if not log_path.exists():
@@ -581,12 +730,27 @@ def main() -> int:
             w.writerow({k: row.get(k, "") for k in header})
 
     def fmt(row: dict[str, float]) -> str:
+        ctx_psnr = _psnr_from_mse(row["ctx_mse"])
+        grad_norm = row.get("grad_norm")
+        grad_norm_str = f"{float(grad_norm):.2f}" if grad_norm is not None and math.isfinite(float(grad_norm)) else "NA"
+        lr_m = row.get("lr_mvsplat")
+        lr_e = row.get("lr_elic")
+        lr_m_str = f"{float(lr_m):.1e}" if lr_m is not None and float(lr_m) > 0 else "NA"
+        lr_e_str = f"{float(lr_e):.1e}" if lr_e is not None and float(lr_e) > 0 else "NA"
         return (
             f"loss={row['loss_total']:.4f} "
             f"bpp={row['rate_bpp']:.4f} "
             f"dist={row['dist_nvs']:.4f} "
-            f"aux={row['aux_loss']:.4f}"
+            f"dist*={row['dist_nvs_scaled']:.4f} "
+            f"ctx_psnr={ctx_psnr:.2f} "
+            f"aux={row['aux_loss']:.4f} "
+            f"g={grad_norm_str} "
+            f"lr={lr_m_str}/{lr_e_str}"
         )
+
+    def _psnr_from_mse(mse: float, *, eps: float = 1e-10) -> float:
+        # Images are in [0,1], so PSNR = 10*log10(1/mse) = -10*log10(mse).
+        return -10.0 * math.log10(max(float(mse), float(eps)))
 
     def write_epoch_row(row: dict[str, float]) -> None:
         if steps_per_epoch_nominal is None:
@@ -606,9 +770,7 @@ def main() -> int:
             return next(iterator)
 
     def run_step(batch: dict[str, Any], global_step: int) -> dict[str, Any]:
-        # Keep view sampling schedules consistent with MVSplat.
-        step_tracker.set_step(global_step)
-
+        mvs_global_step = int(view_sampler_step_offset) + int(global_step)
         batch = _move_to_device(batch, args.device)
         batch = data_shim(batch)
 
@@ -631,7 +793,7 @@ def main() -> int:
 
         # Render the target view(s).
         _, _, _, th, tw = batch["target"]["image"].shape
-        gaussians = mvsplat.encoder(batch["context"], global_step, False, scene_names=batch["scene"])
+        gaussians = mvsplat.encoder(batch["context"], mvs_global_step, False, scene_names=batch["scene"])
         output = mvsplat.decoder.forward(
             gaussians,
             batch["target"]["extrinsics"],
@@ -650,7 +812,7 @@ def main() -> int:
         dist_mse: torch.Tensor | None = None
         dist_other = torch.zeros((), dtype=torch.float32, device=rate_bpp.device)
         for loss_fn in mvsplat.losses:
-            term = loss_fn.forward(output, batch, gaussians, global_step)
+            term = loss_fn.forward(output, batch, gaussians, mvs_global_step)
             dist_nvs = dist_nvs + term
             if type(loss_fn).__name__ == "LossMse":
                 dist_mse = term
@@ -683,19 +845,32 @@ def main() -> int:
         }
 
     def train_one_step(global_step: int) -> dict[str, float]:
+        # Ensure the dataloader's view sampling schedules see the intended global step.
+        step_tracker.set_step(int(view_sampler_step_offset) + int(global_step))
         batch = next_batch()
+
+        lr_mvsplat = float(optim_main.param_groups[0]["lr"]) if len(optim_main.param_groups) > 0 else math.nan
+        lr_elic = float(optim_main.param_groups[1]["lr"]) if len(optim_main.param_groups) > 1 else math.nan
+        lr_elic_aux = float(optim_aux.param_groups[0]["lr"]) if len(optim_aux.param_groups) > 0 else math.nan
 
         optim_main.zero_grad(set_to_none=True)
         optim_aux.zero_grad(set_to_none=True)
 
         out = run_step(batch, global_step)
         out["loss_total"].backward()
+        grad_norm = math.nan
         if args.grad_clip and args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm_t = torch.nn.utils.clip_grad_norm_(
                 [p for p in list(mvsplat.parameters()) + list(elic.parameters()) if p.requires_grad],
                 float(args.grad_clip),
             )
+            try:
+                grad_norm = float(grad_norm_t.detach().cpu().item())
+            except Exception:
+                grad_norm = float(grad_norm_t)
         optim_main.step()
+        if scheduler_main is not None:
+            scheduler_main.step()
 
         aux_loss = elic.aux_loss()
         aux_loss.backward()
@@ -703,12 +878,18 @@ def main() -> int:
 
         return {
             "step": float(global_step),
+            "lr_mvsplat": float(lr_mvsplat),
+            "lr_elic": float(lr_elic),
+            "lr_elic_aux": float(lr_elic_aux),
             "loss_total": float(out["loss_total"].detach().cpu().item()),
             "rate_bpp": float(out["rate_bpp"].cpu().item()),
             "dist_nvs": float(out["dist_nvs"].cpu().item()),
+            "dist_nvs_mse": float(out["dist_nvs_mse"].cpu().item()),
+            "dist_nvs_other": float(out["dist_nvs_other"].cpu().item()),
             "dist_nvs_scaled": float(out["dist_nvs_scaled"].cpu().item()),
             "ctx_mse": float(out["ctx_mse"].cpu().item()),
             "aux_loss": float(aux_loss.detach().cpu().item()),
+            "grad_norm": float(grad_norm),
             "time_s": float(time.time() - start_time),
         }
 
@@ -816,31 +997,252 @@ def main() -> int:
         )
 
     if use_rich:
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("{task.description}"),
-            BarColumn(bar_width=None),
-            TextColumn("{task.completed}/{task.total}"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            refresh_per_second=10,
+        try:
+            from rich import box  # type: ignore[import-not-found]
+            from rich.console import Console, Group  # type: ignore[import-not-found]
+            from rich.layout import Layout  # type: ignore[import-not-found]
+            from rich.live import Live  # type: ignore[import-not-found]
+            from rich.panel import Panel  # type: ignore[import-not-found]
+            from rich.progress_bar import ProgressBar  # type: ignore[import-not-found]
+            from rich.table import Table  # type: ignore[import-not-found]
+            from rich.text import Text  # type: ignore[import-not-found]
+        except Exception:
+            use_rich = False
+
+    if use_rich:
+        def _fmt_float(value: Any, fmt: str, *, default: str = "--") -> str:
+            try:
+                x = float(value)
+            except Exception:
+                return default
+            if not math.isfinite(x):
+                return default
+            return fmt.format(x)
+
+        def _fmt_time(seconds: Any) -> str:
+            try:
+                s = float(seconds)
+            except Exception:
+                return "--:--"
+            if not math.isfinite(s) or s < 0:
+                return "--:--"
+            t = int(s + 0.5)
+            m, sec = divmod(t, 60)
+            h, m = divmod(m, 60)
+            return f"{h:d}:{m:02d}:{sec:02d}" if h > 0 else f"{m:d}:{sec:02d}"
+
+        def _kv_table(rows: list[tuple[str, str]]) -> Table:
+            t = Table.grid(expand=True, padding=(0, 1))
+            t.add_column(justify="right", style="bright_black", no_wrap=True)
+            t.add_column(justify="left", no_wrap=True)
+            for k, v in rows:
+                t.add_row(k, v)
+            return t
+
+        def _panel(title: str, body: Any, *, style: str) -> Panel:
+            return Panel(body, title=title, border_style=style, box=box.ROUNDED, padding=(0, 1))
+
+        console = Console()
+
+        if args.device == "cuda":
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+
+        ema_sps: float | None = None
+        last_wall = time.time()
+        last_log_step_1b: int | None = None
+        last_log_msg = ""
+        last_snapshot_step_1b: int | None = None
+
+        layout = Layout()
+        layout.split(
+            Layout(name="header", size=5),
+            Layout(name="main", ratio=1),
         )
-        task = progress.add_task(
-            f"train {args.tag} (λ_elic={lmbda_str}, λ_rd={rd_lmbda_str}, s_mse={args.nvs_mse_scale:g})",
-            total=max_steps,
+        layout["main"].split(
+            Layout(name="top", size=11),
+            Layout(name="bottom", ratio=1),
         )
-        with progress:
+        layout["top"].split_row(
+            Layout(name="progress"),
+            Layout(name="rd"),
+            Layout(name="optim"),
+        )
+        layout["bottom"].split_row(
+            Layout(name="dist"),
+            Layout(name="system"),
+        )
+
+        with Live(layout, console=console, refresh_per_second=10, transient=False):
             for step in range(max_steps):
                 row = train_one_step(step)
+                global_step_1b = int(step) + 1
+                effective_step = int(view_sampler_step_offset) + int(step)
+
+                now = time.time()
+                dt = now - last_wall
+                last_wall = now
+                if dt > 0:
+                    sps = 1.0 / dt
+                    ema_sps = sps if ema_sps is None else (0.9 * ema_sps + 0.1 * sps)
+
+                eta_s = (
+                    (float(max_steps - global_step_1b) / float(ema_sps))
+                    if ema_sps is not None and ema_sps > 0
+                    else math.nan
+                )
+                epoch_nominal = (
+                    (1.0 + (float(global_step_1b - 1) / float(steps_per_epoch_nominal)))
+                    if steps_per_epoch_nominal is not None
+                    else math.nan
+                )
+
                 if (step % int(args.log_every)) == 0 or step == max_steps - 1:
                     write_row(row)
-                    progress.update(task, description=f"train {args.tag} | {fmt(row)}")
-                global_step_1b = int(step) + 1
+                    last_log_step_1b = global_step_1b
+                    last_log_msg = fmt(row)
+
                 epoch_accumulate(row, global_step_1b)
                 epoch_maybe_flush(row, global_step_1b=global_step_1b, is_last_step=step == max_steps - 1)
+
                 if save_every_steps is not None and (global_step_1b % int(save_every_steps)) == 0:
                     save_snapshot(global_step_1b)
-                progress.advance(task, 1)
+                    last_snapshot_step_1b = global_step_1b
+
+                # Header tile.
+                header_left = _kv_table(
+                    [
+                        ("run", str(run_dir.name)),
+                        ("device", str(args.device)),
+                        ("bs/workers", f"{int(args.batch_size)}/{int(args.num_workers)}"),
+                        ("seed", str(int(args.seed))),
+                    ]
+                )
+                header_right = _kv_table(
+                    [
+                        ("λ_elic/λ_rd", f"{lmbda_str}/{rd_lmbda_str}"),
+                        ("s_mse", f"{float(args.nvs_mse_scale):g}"),
+                        ("sched", str(args.lr_schedule)),
+                        ("offset", str(int(view_sampler_step_offset))),
+                    ]
+                )
+                header_grid = Table.grid(expand=True)
+                header_grid.add_column(ratio=1)
+                header_grid.add_column(ratio=1)
+                header_grid.add_row(header_left, header_right)
+                layout["header"].update(_panel("Run", header_grid, style="cyan"))
+
+                # Progress tile.
+                bar = ProgressBar(total=float(max_steps), completed=float(global_step_1b), width=None)
+                prog_lines = Group(
+                    Text(
+                        f"step {global_step_1b:,}/{max_steps:,} "
+                        f"({_fmt_float(100.0 * global_step_1b / max(1, max_steps), '{:.2f}')}%)"
+                    ),
+                    Text(f"epoch (nominal): {_fmt_float(epoch_nominal, '{:.2f}', default='--')}"),
+                    Text(f"effective global step: {effective_step:,}"),
+                    bar,
+                    Text(
+                        f"sps={_fmt_float(ema_sps, '{:.2f}', default='--')} | "
+                        f"elapsed={_fmt_time(row.get('time_s'))} | "
+                        f"eta={_fmt_time(eta_s)}"
+                    ),
+                )
+                layout["progress"].update(_panel("Progress", prog_lines, style="bright_black"))
+
+                # RD tile.
+                loss_total = row.get("loss_total", math.nan)
+                rate_bpp = row.get("rate_bpp", math.nan)
+                dist_raw = row.get("dist_nvs", math.nan)
+                dist_scaled = row.get("dist_nvs_scaled", math.nan)
+                ctx_mse = row.get("ctx_mse", math.nan)
+                rd_term = float(rd_lambda) * float(dist_scaled) if math.isfinite(float(dist_scaled)) else math.nan
+                ctx_reg_term = (
+                    float(args.ctx_reg_beta) * (float(ctx_mse) * (255.0**2))
+                    if args.ctx_reg_beta > 0 and math.isfinite(float(ctx_mse))
+                    else 0.0
+                )
+                rd_table = _kv_table(
+                    [
+                        ("L_total", _fmt_float(loss_total, "{:.4f}")),
+                        ("R (bpp_est)", _fmt_float(rate_bpp, "{:.4f}")),
+                        ("λ·D_scaled", _fmt_float(rd_term, "{:.4f}")),
+                        ("D_scaled", _fmt_float(dist_scaled, "{:.4f}")),
+                        ("D_raw", _fmt_float(dist_raw, "{:.4f}")),
+                        ("ctx_psnr", _fmt_float(_psnr_from_mse(float(ctx_mse)), "{:.2f} dB")),
+                        ("β·ctx_mse", _fmt_float(ctx_reg_term, "{:.4f}")),
+                    ]
+                )
+                layout["rd"].update(_panel("RD Objective", rd_table, style="green"))
+
+                # Optimization tile.
+                lr_table = _kv_table(
+                    [
+                        ("lr_mvsplat", _fmt_float(row.get("lr_mvsplat"), "{:.2e}")),
+                        ("lr_elic", _fmt_float(row.get("lr_elic"), "{:.2e}")),
+                        ("lr_aux", _fmt_float(row.get("lr_elic_aux"), "{:.2e}")),
+                        ("grad_norm", _fmt_float(row.get("grad_norm"), "{:.2f}")),
+                        ("aux_loss", _fmt_float(row.get("aux_loss"), "{:.4f}")),
+                        ("noisequant", str(bool(args.elic_noisequant))),
+                    ]
+                )
+                layout["optim"].update(_panel("Optimization", lr_table, style="blue"))
+
+                # Distortion breakdown tile.
+                dist_mse = row.get("dist_nvs_mse", math.nan)
+                dist_other = row.get("dist_nvs_other", math.nan)
+                dist_mse_scaled = (
+                    float(dist_mse) * float(args.nvs_mse_scale) if math.isfinite(float(dist_mse)) else math.nan
+                )
+                dist_check = (
+                    (float(dist_mse_scaled) + float(dist_other) - float(dist_scaled))
+                    if math.isfinite(float(dist_mse_scaled))
+                    and math.isfinite(float(dist_other))
+                    and math.isfinite(float(dist_scaled))
+                    else math.nan
+                )
+                lpips_status = "n/a"
+                if lpips_apply_after_step is not None:
+                    lpips_status = "on" if effective_step >= int(lpips_apply_after_step) else "off"
+                dist_table = _kv_table(
+                    [
+                        ("MSE", _fmt_float(dist_mse, "{:.4f}")),
+                        ("Other", _fmt_float(dist_other, "{:.4f}")),
+                        ("s_mse·MSE", _fmt_float(dist_mse_scaled, "{:.4f}")),
+                        ("D_scaled", _fmt_float(dist_scaled, "{:.4f}")),
+                        ("(sum−D*)", _fmt_float(dist_check, "{:.2e}")),
+                        ("LPIPS", lpips_status),
+                    ]
+                )
+                layout["dist"].update(_panel("Distortion", dist_table, style="magenta"))
+
+                # System / I/O tile.
+                gpu_name = "cpu"
+                mem_alloc = mem_reserved = mem_peak = "--"
+                if args.device == "cuda":
+                    try:
+                        gpu_name = torch.cuda.get_device_name(0)
+                        mem_alloc = _fmt_float(torch.cuda.memory_allocated() / (1024.0**3), "{:.2f} GiB")
+                        mem_reserved = _fmt_float(torch.cuda.memory_reserved() / (1024.0**3), "{:.2f} GiB")
+                        mem_peak = _fmt_float(torch.cuda.max_memory_allocated() / (1024.0**3), "{:.2f} GiB")
+                    except Exception:
+                        gpu_name = "cuda"
+                system_table = _kv_table(
+                    [
+                        ("gpu", str(gpu_name)),
+                        ("mem", f"{mem_alloc} alloc | {mem_reserved} rsvd | {mem_peak} peak"),
+                        ("log", f"{str(last_log_step_1b) if last_log_step_1b is not None else '--'} @ {log_path.name}"),
+                        (
+                            "ckpt",
+                            f"{str(last_snapshot_step_1b) if last_snapshot_step_1b is not None else '--'} "
+                            f"@ {('checkpoints/' if save_every_steps else 'disabled')}",
+                        ),
+                    ]
+                )
+                sys_body = Group(system_table, Text(last_log_msg, style="bright_black") if last_log_msg else Text(""))
+                layout["system"].update(_panel("System", sys_body, style="yellow"))
     elif use_tqdm and tqdm is not None:
         desc = f"train {args.tag} (λ_elic={lmbda_str}, λ_rd={rd_lmbda_str}, s_mse={args.nvs_mse_scale:g})"
         with tqdm(total=max_steps, desc=desc, dynamic_ncols=True) as pbar:
