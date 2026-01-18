@@ -148,7 +148,21 @@ def _plot_metric(
         y = _as_float(r.get(metric, "nan"))
         if not tag or bpp != bpp or y != y:  # NaN checks
             continue
-        groups[_group_key(tag)].append({"bpp": bpp, "y": y, "tag": tag, "row": r})
+        group = _group_key(tag)
+        lmbda = _extract_lambda_from_row(r)
+        rd = _extract_rd_lambda_from_row(r)
+        if rd is None:
+            rd = lmbda
+        groups[group].append(
+            {
+                "bpp": bpp,
+                "y": y,
+                "tag": tag,
+                "row": r,
+                "lmbda": lmbda,
+                "rd": rd,
+            }
+        )
 
     if not groups:
         raise SystemExit(f"No valid rows to plot for metric={metric}.")
@@ -169,12 +183,25 @@ def _plot_metric(
         zoom_xlim = (x_min - pad, x_max + pad)
 
     palette = list(plt.get_cmap("tab10").colors)
-    group_keys_sorted = sorted(groups.keys())
-    label_note = (
-        "Point labels: baseline shows ELIC λ; E2E shows (ELIC λ, λ_rd)." if label_points else None
-    )
+
+    # Color encodes the ELIC checkpoint family λ.
+    lambda_values: dict[str, float] = {}
+    for pt in non_baseline_pts:
+        lmbda = pt.get("lmbda")
+        if lmbda is None:
+            continue
+        lambda_values[_format_lambda(float(lmbda))] = float(lmbda)
+    lambda_keys_sorted = sorted(lambda_values.keys(), key=lambda s: float(s))
+    lambda_color = {k: palette[i % len(palette)] for i, k in enumerate(lambda_keys_sorted)}
+
+    has_e2e = any("e2e" in group for group in groups.keys())
+    label_note = None
+    if label_points and has_e2e:
+        label_note = "Colors: ELIC λ. Point labels: E2E shows λ_rd."
+    elif label_points:
+        label_note = "Colors: ELIC λ."
     if note and label_note:
-        note = f"{note}\\n{label_note}"
+        note = f"{note}\n{label_note}"
     elif label_note:
         note = label_note
 
@@ -238,51 +265,70 @@ def _plot_metric(
                 # If we can't compute extents (rare backend issues), keep the first label.
                 return
 
-    for group in group_keys_sorted:
-        pts = sorted(groups[group], key=lambda d: float(d["bpp"]))
-        xs = [float(p["bpp"]) for p in pts]
-        ys = [float(p["y"]) for p in pts]
-        if group == baseline_key and baseline_pts and zoom_xs:
+    # Baseline (ELIC → MVSplat): one curve, colored markers per ELIC λ.
+    baseline_curve_pts = sorted(groups.get("v1", []), key=lambda d: float(d["bpp"]))
+    if baseline_curve_pts:
+        xs = [float(p["bpp"]) for p in baseline_curve_pts]
+        ys = [float(p["y"]) for p in baseline_curve_pts]
+        ax.plot(xs, ys, linestyle="-", color="0.35", zorder=1)
+        for p in baseline_curve_pts:
+            lmbda = p.get("lmbda")
+            lkey = _format_lambda(float(lmbda)) if lmbda is not None else None
+            color = lambda_color.get(lkey, "0.35")
+            ax.plot(
+                [float(p["bpp"])],
+                [float(p["y"])],
+                marker="o",
+                linestyle="None",
+                color=color,
+                markerfacecolor=color,
+                markeredgecolor=color,
+                markeredgewidth=1.6,
+                zorder=3,
+            )
+
+    # E2E fine-tuned: triangles, colored by ELIC λ; point labels show only λ_rd.
+    e2e_pts: list[dict[str, Any]] = []
+    for group, pts in groups.items():
+        if group == baseline_key:
             continue
-        color_idx = _stable_index(group, len(palette))
-        color = palette[color_idx]
-        # Marker convention (paper-friendly):
-        #   - Baseline (ELIC → MVSplat): solid circles.
-        #   - Other evals / methods: triangles and squares.
-        if group == "v1":
-            marker = "o"
-            marker_face = color
-        elif "e2e" in group:
-            marker = "s"
-            marker_face = "white"
-        else:
-            marker = "^"
-            marker_face = "white"
+        if "e2e" in group:
+            e2e_pts.extend(pts)
+
+    e2e_by_lambda: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for p in e2e_pts:
+        lmbda = p.get("lmbda")
+        if lmbda is None:
+            continue
+        e2e_by_lambda[_format_lambda(float(lmbda))].append(p)
+
+    offset_cycle = [(10, 12), (10, -16), (-10, 12), (-10, -16)]
+    for lkey in lambda_keys_sorted:
+        pts = e2e_by_lambda.get(lkey, [])
+        if not pts:
+            continue
+        pts_sorted = sorted(pts, key=lambda d: float(d["bpp"]))
+        xs = [float(p["bpp"]) for p in pts_sorted]
+        ys = [float(p["y"]) for p in pts_sorted]
+        color = lambda_color.get(lkey, "0.35")
         ax.plot(
             xs,
             ys,
-            marker=marker,
-            linestyle="-",
+            marker="^",
+            linestyle="--",
             color=color,
-            markerfacecolor=marker_face,
+            markerfacecolor="white",
             markeredgecolor=color,
             markeredgewidth=1.6,
-            label=_pretty_group_label(group),
+            zorder=2,
         )
         if label_points:
-            offset_cycle = [(10, 12), (10, -16), (-10, 12), (-10, -16)]
-            for pi, (x, y, p) in enumerate(zip(xs, ys, pts)):
-                row_payload = p.get("row", {})
-                lmbda = _extract_lambda_from_row(row_payload) if isinstance(row_payload, dict) else None
-                if lmbda is None:
+            for pi, (x, y, p) in enumerate(zip(xs, ys, pts_sorted)):
+                rd = p.get("rd")
+                if rd is None:
                     continue
-                label = f"λ={_format_lambda(lmbda)}"
-                if "e2e" in group:
-                    rd = _extract_rd_lambda_from_row(row_payload) if isinstance(row_payload, dict) else None
-                    if rd is None:
-                        rd = lmbda
-                    label = f"λ={_format_lambda(lmbda)}\nλ_rd={_format_lambda(rd)}"
-                base_offset = offset_cycle[(color_idx + pi) % len(offset_cycle)]
+                label = f"λ_rd={_format_lambda(float(rd))}"
+                base_offset = offset_cycle[pi % len(offset_cycle)]
                 annotate_point(x=x, y=y, text=label, color=color, base_offset=base_offset)
 
     if baseline_pts and zoom_xs:
@@ -325,7 +371,61 @@ def _plot_metric(
     ax.margins(x=0.06, y=0.12)
     if zoom_xlim is not None:
         ax.set_xlim(*zoom_xlim)
-    ax.legend(loc="best", frameon=False, title="Method")
+    try:
+        from matplotlib.lines import Line2D
+    except Exception:
+        Line2D = None  # type: ignore[assignment]
+
+    if Line2D is not None:
+        method_handles: list[Any] = []
+        if baseline_curve_pts:
+            method_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    linestyle="-",
+                    color="0.35",
+                    marker="o",
+                    markerfacecolor="0.35",
+                    markeredgecolor="0.35",
+                    label="Baseline (ELIC → MVSplat)",
+                )
+            )
+        if e2e_pts:
+            method_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    linestyle="--",
+                    color="0.35",
+                    marker="^",
+                    markerfacecolor="white",
+                    markeredgecolor="0.35",
+                    label="E2E fine-tuned",
+                )
+            )
+        if baseline_pts and zoom_xs:
+            method_handles.append(Line2D([0], [0], linestyle=":", color="0.25", label="Uncompressed (24 bpp)"))
+        if method_handles:
+            method_legend = ax.legend(handles=method_handles, loc="upper left", frameon=False, title="Method")
+            ax.add_artist(method_legend)
+
+        lambda_handles: list[Any] = []
+        for lkey in lambda_keys_sorted:
+            color = lambda_color[lkey]
+            lambda_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    linestyle="None",
+                    marker="o",
+                    markerfacecolor=color,
+                    markeredgecolor=color,
+                    label=f"λ={lkey}",
+                )
+            )
+        if lambda_handles:
+            ax.legend(handles=lambda_handles, loc="lower right", frameon=False, title="ELIC λ")
     if note:
         fig.text(0.01, 0.01, note, ha="left", va="bottom", fontsize=9)
 
@@ -372,7 +472,7 @@ def main() -> int:
         "--label-points",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Annotate each RD point with its λ (parsed from the row tag).",
+        help="Annotate E2E points with λ_rd (baseline uses colors for λ).",
     )
     args = parser.parse_args()
 
