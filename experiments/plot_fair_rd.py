@@ -213,24 +213,29 @@ def _plot_metric(
         color: Any,
         base_offset: tuple[int, int],
     ) -> None:
-        # Simple collision-avoidance heuristic: try a sequence of offsets and pick the first
-        # that doesn't overlap existing label boxes.
+        # Collision-avoidance heuristic: keep labels close to the point, but nudge when needed.
         #
-        # We avoid new dependencies (e.g., adjustText) but still get "paper-ready" readability.
-        offset_candidates = [
-            base_offset,
-            (base_offset[0], base_offset[1] + 16),
-            (base_offset[0], base_offset[1] - 16),
-            (base_offset[0] * 2, base_offset[1]),
-            (base_offset[0] * 2, base_offset[1] + 16),
-            (base_offset[0] * 2, base_offset[1] - 16),
-            (-base_offset[0], base_offset[1]),
-            (-base_offset[0], base_offset[1] + 16),
-            (-base_offset[0], base_offset[1] - 16),
-            (-base_offset[0] * 2, base_offset[1]),
-            (-base_offset[0] * 2, base_offset[1] + 16),
-            (-base_offset[0] * 2, base_offset[1] - 16),
+        # We avoid new dependencies (e.g., adjustText) but still get good readability.
+        radii = [0, 10, 18, 26]
+        directions = [
+            (1, 1),
+            (1, 0),
+            (0, 1),
+            (-1, 1),
+            (-1, 0),
+            (0, -1),
+            (1, -1),
+            (-1, -1),
         ]
+        offset_candidates_raw: list[tuple[int, int]] = []
+        for r in radii:
+            for dx_sign, dy_sign in directions:
+                offset_candidates_raw.append((int(base_offset[0] + dx_sign * r), int(base_offset[1] + dy_sign * r)))
+        # De-dupe, but keep close-by offsets first.
+        offset_candidates = sorted(
+            set(offset_candidates_raw),
+            key=lambda xy: (abs(int(xy[0])) + abs(int(xy[1])), abs(int(xy[0])), abs(int(xy[1]))),
+        )
 
         renderer = None
         used_bboxes = getattr(annotate_point, "_used_bboxes", None)
@@ -238,9 +243,32 @@ def _plot_metric(
             used_bboxes = []
             setattr(annotate_point, "_used_bboxes", used_bboxes)
 
-        for dx, dy in offset_candidates:
-            ha = "left" if dx >= 0 else "right"
-            va = "bottom" if dy >= 0 else "top"
+        for idx, (dx, dy) in enumerate(offset_candidates):
+            if dx > 0:
+                ha = "left"
+            elif dx < 0:
+                ha = "right"
+            else:
+                ha = "center"
+            if dy > 0:
+                va = "bottom"
+            elif dy < 0:
+                va = "top"
+            else:
+                va = "center"
+
+            arrowprops = None
+            # When we have to move a label away from its first-choice offset, add a subtle
+            # connector line so it's still clear which point it belongs to.
+            if idx != 0:
+                arrowprops = {
+                    "arrowstyle": "-",
+                    "lw": 0.8,
+                    "color": color,
+                    "alpha": 0.65,
+                    "shrinkA": 2,
+                    "shrinkB": 2,
+                }
             txt = ax.annotate(
                 text,
                 xy=(x, y),
@@ -250,6 +278,7 @@ def _plot_metric(
                 ha=ha,
                 va=va,
                 color=color,
+                arrowprops=arrowprops,
             )
             txt.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
             try:
@@ -303,7 +332,7 @@ def _plot_metric(
         e2e_by_lambda[_format_lambda(float(lmbda))].append(p)
 
     offset_cycle = [(10, 12), (10, -16), (-10, 12), (-10, -16)]
-    for lkey in lambda_keys_sorted:
+    for li, lkey in enumerate(lambda_keys_sorted):
         pts = e2e_by_lambda.get(lkey, [])
         if not pts:
             continue
@@ -328,7 +357,7 @@ def _plot_metric(
                 if rd is None:
                     continue
                 label = f"λ_rd={_format_lambda(float(rd))}"
-                base_offset = offset_cycle[pi % len(offset_cycle)]
+                base_offset = offset_cycle[(li + pi) % len(offset_cycle)]
                 annotate_point(x=x, y=y, text=label, color=color, base_offset=base_offset)
 
     if baseline_pts and zoom_xs:
